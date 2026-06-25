@@ -13,28 +13,41 @@ from jupyter_mcp_server.hooks import HookEvent, HookRegistry
 from jupyter_nbmodel_client import NotebookModel
 
 
-def get_current_notebook_context(notebook_manager=None):
+def get_current_notebook_context(notebook_manager=None, notebook_name=None):
     """
-    Get the current notebook path and kernel ID for JUPYTER_SERVER mode.
-    
+    Get the notebook path and kernel ID, optionally for a specific named notebook.
+
     Args:
         notebook_manager: NotebookManager instance (optional)
-        
+        notebook_name: Target a specific registered notebook by name (optional).
+            If provided and non-empty, uses this notebook instead of the active one.
+
     Returns:
         Tuple of (notebook_path, kernel_id)
         Falls back to config values if notebook_manager not provided
+
+    Raises:
+        ValueError: If notebook_name is given but not registered in the manager
     """
     from .config import get_config
-    
+
     notebook_path = None
     kernel_id = None
-    
+
     if notebook_manager:
-        # Try to get current notebook info from manager
-        notebook_path = notebook_manager.get_current_notebook_path()
-        current_notebook = notebook_manager.get_current_notebook() or "default"
-        kernel_id = notebook_manager.get_kernel_id(current_notebook)
-    
+        if notebook_name:
+            if notebook_name not in notebook_manager:
+                raise ValueError(
+                    f"Notebook '{notebook_name}' is not registered. "
+                    f"Call use_notebook first to open it."
+                )
+            notebook_path = notebook_manager.get_notebook_path(notebook_name)
+            kernel_id = notebook_manager.get_kernel_id(notebook_name)
+        else:
+            notebook_path = notebook_manager.get_current_notebook_path()
+            current_notebook = notebook_manager.get_current_notebook() or "default"
+            kernel_id = notebook_manager.get_kernel_id(current_notebook)
+
     # Fallback to config if not found in manager
     if not notebook_path or not kernel_id:
         config = get_config()
@@ -42,7 +55,7 @@ def get_current_notebook_context(notebook_manager=None):
             notebook_path = config.document_id
         if not kernel_id:
             kernel_id = config.runtime_id
-    
+
     return notebook_path, kernel_id
 
 

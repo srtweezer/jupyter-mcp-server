@@ -441,6 +441,26 @@ async def read_notebook(
 ###############################################################################
 # Cell Tools.
 
+from contextlib import contextmanager
+
+@contextmanager
+def _target_notebook(manager, name):
+    """Temporarily switch the active notebook if *name* is non-empty."""
+    if not name:
+        yield
+        return
+    if name not in manager:
+        raise ValueError(
+            f"Notebook '{name}' is not registered. "
+            f"Call use_notebook first to open it."
+        )
+    prev = manager.get_current_notebook()
+    manager._current_notebook = name
+    try:
+        yield
+    finally:
+        manager._current_notebook = prev
+
 @mcp.tool(
     annotations=ToolAnnotations(
         title="Insert Cell",
@@ -452,20 +472,22 @@ async def insert_cell(
     cell_index: Annotated[int, Field(description="Target index for insertion (0-based), use -1 to append at end", ge=-1)],
     cell_type: Annotated[Literal["code", "markdown"], Field(description="Type of cell to insert")],
     cell_source: Annotated[str, Field(description="Source content for the cell")],
+    notebook_name: Annotated[str, Field(description="Target notebook name. If omitted, uses the currently active notebook.")] = "",
 ) -> Annotated[str, Field(description="Success message and the structure of its surrounding cells")]:
-    """Insert a cell to specified position from the currently activated notebook."""
-    return await safe_notebook_operation(
-        lambda: InsertCellTool().execute(
-            mode=server_context.mode,
-            server_client=server_context.server_client,
-            contents_manager=server_context.contents_manager,
-            kernel_manager=server_context.kernel_manager,
-            notebook_manager=notebook_manager,
-            cell_index=cell_index,
-            cell_source=cell_source,
-            cell_type=cell_type,
+    """Insert a cell to specified position. Pass notebook_name to target a specific notebook."""
+    with _target_notebook(notebook_manager, notebook_name):
+        return await safe_notebook_operation(
+            lambda: InsertCellTool().execute(
+                mode=server_context.mode,
+                server_client=server_context.server_client,
+                contents_manager=server_context.contents_manager,
+                kernel_manager=server_context.kernel_manager,
+                notebook_manager=notebook_manager,
+                cell_index=cell_index,
+                cell_source=cell_source,
+                cell_type=cell_type,
+            )
         )
-    )
 
 @mcp.tool(
     annotations=ToolAnnotations(
@@ -477,23 +499,25 @@ async def insert_cell(
 async def overwrite_cell_source(
     cell_index: Annotated[int, Field(description="Index of the cell to overwrite (0-based)", ge=0)],
     cell_source: Annotated[str, Field(description="New complete cell source")],
+    notebook_name: Annotated[str, Field(description="Target notebook name. If omitted, uses the currently active notebook.")] = "",
 ) -> Annotated[str, Field(description="Success message with diff showing changes made")]:
-    """Replace the entire source of a cell in the currently activated notebook.
+    """Replace the entire source of a cell. Pass notebook_name to target a specific notebook.
     Returns a diff showing the changes made.
 
     Use this when rewriting a cell completely. For small, targeted changes,
     prefer edit_cell_source instead — it is safer for partial edits."""
-    return await safe_notebook_operation(
-        lambda: OverwriteCellSourceTool().execute(
-            mode=server_context.mode,
-            server_client=server_context.server_client,
-            contents_manager=server_context.contents_manager,
-            kernel_manager=server_context.kernel_manager,
-            notebook_manager=notebook_manager,
-            cell_index=cell_index,
-            cell_source=cell_source,
+    with _target_notebook(notebook_manager, notebook_name):
+        return await safe_notebook_operation(
+            lambda: OverwriteCellSourceTool().execute(
+                mode=server_context.mode,
+                server_client=server_context.server_client,
+                contents_manager=server_context.contents_manager,
+                kernel_manager=server_context.kernel_manager,
+                notebook_manager=notebook_manager,
+                cell_index=cell_index,
+                cell_source=cell_source,
+            )
         )
-    )
 
 @mcp.tool(
     annotations=ToolAnnotations(
@@ -506,8 +530,9 @@ async def edit_cell_source(
     old_string: Annotated[str, Field(description="Exact string to find in cell source")],
     new_string: Annotated[str, Field(description="Replacement string")],
     replace_all: Annotated[bool, Field(description="Replace all occurrences (default: first only)")] = False,
+    notebook_name: Annotated[str, Field(description="Target notebook name. If omitted, uses the currently active notebook.")] = "",
 ) -> Annotated[str, Field(description="Success message with diff showing changes made")]:
-    """Perform a surgical find-and-replace within a cell's source (like an editor's Edit tool).
+    """Perform a surgical find-and-replace within a cell's source. Pass notebook_name to target a specific notebook.
     Finds `old_string` in the cell and replaces it with `new_string`. Matching is literal
     (not regex) and may span multiple lines. By default, `old_string` must appear exactly once;
     set `replace_all=True` for multiple occurrences. Returns a diff of the changes made.
@@ -515,19 +540,20 @@ async def edit_cell_source(
     Prefer this over overwrite_cell_source for small, targeted edits — it is safer because
     unchanged parts of the cell are left untouched. Use read_cell first to see the current
     source and construct an accurate old_string."""
-    return await safe_notebook_operation(
-        lambda: EditCellSourceTool().execute(
-            mode=server_context.mode,
-            server_client=server_context.server_client,
-            contents_manager=server_context.contents_manager,
-            kernel_manager=server_context.kernel_manager,
-            notebook_manager=notebook_manager,
-            cell_index=cell_index,
-            old_string=old_string,
-            new_string=new_string,
-            replace_all=replace_all,
+    with _target_notebook(notebook_manager, notebook_name):
+        return await safe_notebook_operation(
+            lambda: EditCellSourceTool().execute(
+                mode=server_context.mode,
+                server_client=server_context.server_client,
+                contents_manager=server_context.contents_manager,
+                kernel_manager=server_context.kernel_manager,
+                notebook_manager=notebook_manager,
+                cell_index=cell_index,
+                old_string=old_string,
+                new_string=new_string,
+                replace_all=replace_all,
+            )
         )
-    )
 
 @mcp.tool(
     annotations=ToolAnnotations(
@@ -542,23 +568,25 @@ async def execute_cell(
     timeout: Annotated[int, Field(description="Maximum seconds to wait for execution")] = 90,
     stream: Annotated[bool, Field(description="Enable streaming progress (including time indicator) updates for long-running cells")] = False,
     progress_interval: Annotated[int, Field(description="Seconds between progress updates when stream=True")] = 5,
+    notebook_name: Annotated[str, Field(description="Target notebook name. If omitted, uses the currently active notebook.")] = "",
 ) -> Annotated[list[str | ImageContent], Field(description="List of outputs from the executed cell")]:
-    """Execute a cell from the currently activated notebook with timeout and return it's outputs"""
-    return await safe_notebook_operation(
-        lambda: ExecuteCellTool().execute(
-            mode=server_context.mode,
-            server_client=server_context.server_client,
-            contents_manager=server_context.contents_manager,
-            kernel_manager=server_context.kernel_manager,
-            notebook_manager=notebook_manager,
-            cell_index=cell_index,
-            timeout_seconds=timeout,
-            stream=stream,
-            progress_interval=progress_interval,
-            ensure_kernel_alive_fn=__ensure_kernel_alive
-        ),
-        max_retries=1
-    )
+    """Execute a cell with timeout and return its outputs. Pass notebook_name to target a specific notebook."""
+    with _target_notebook(notebook_manager, notebook_name):
+        return await safe_notebook_operation(
+            lambda: ExecuteCellTool().execute(
+                mode=server_context.mode,
+                server_client=server_context.server_client,
+                contents_manager=server_context.contents_manager,
+                kernel_manager=server_context.kernel_manager,
+                notebook_manager=notebook_manager,
+                cell_index=cell_index,
+                timeout_seconds=timeout,
+                stream=stream,
+                progress_interval=progress_interval,
+                ensure_kernel_alive_fn=__ensure_kernel_alive
+            ),
+            max_retries=1
+        )
 
 @mcp.tool(
     annotations=ToolAnnotations(
@@ -615,18 +643,20 @@ async def insert_execute_code_cell(
 async def read_cell(
     cell_index: Annotated[int, Field(description="Index of the cell to read (0-based)", ge=0)],
     include_outputs: Annotated[bool, Field(description="Include outputs in the response (only for code cells)")] = True,
+    notebook_name: Annotated[str, Field(description="Target notebook name. If omitted, uses the currently active notebook.")] = "",
 ) -> Annotated[list[str | ImageContent], Field(description="Cell information including index, type, source, and outputs (for code cells)")]:
-    """Read a specific cell from the currently activated notebook and return it's metadata (index, type, execution count), source and outputs (for code cells)"""
-    return await safe_notebook_operation(
-        lambda: ReadCellTool().execute(
-            mode=server_context.mode,
-            server_client=server_context.server_client,
-            contents_manager=server_context.contents_manager,
-            notebook_manager=notebook_manager,
-            cell_index=cell_index,
-            include_outputs=include_outputs,
+    """Read a specific cell. Pass notebook_name to target a specific notebook."""
+    with _target_notebook(notebook_manager, notebook_name):
+        return await safe_notebook_operation(
+            lambda: ReadCellTool().execute(
+                mode=server_context.mode,
+                server_client=server_context.server_client,
+                contents_manager=server_context.contents_manager,
+                notebook_manager=notebook_manager,
+                cell_index=cell_index,
+                include_outputs=include_outputs,
+            )
         )
-    )
 
 @mcp.tool(
     annotations=ToolAnnotations(
@@ -638,19 +668,21 @@ async def read_cell(
 async def delete_cell(
     cell_indices: Annotated[list[int], Field(description="List of cell indices to delete (0-based)",min_items=1)],
     include_source: Annotated[bool, Field(description="Whether to include the source of deleted cells")] = True,
+    notebook_name: Annotated[str, Field(description="Target notebook name. If omitted, uses the currently active notebook.")] = "",
 ) -> Annotated[str, Field(description="Success message with list of deleted cells and their source (if include_source=True)")]:
-    """Delete specific cells from the currently activated notebook and return the cell source of deleted cells (if include_source=True)."""
-    return await safe_notebook_operation(
-        lambda: DeleteCellTool().execute(
-            mode=server_context.mode,
-            server_client=server_context.server_client,
-            contents_manager=server_context.contents_manager,
-            kernel_manager=server_context.kernel_manager,
-            notebook_manager=notebook_manager,
-            cell_indices=cell_indices,
-            include_source=include_source,
+    """Delete specific cells. Pass notebook_name to target a specific notebook."""
+    with _target_notebook(notebook_manager, notebook_name):
+        return await safe_notebook_operation(
+            lambda: DeleteCellTool().execute(
+                mode=server_context.mode,
+                server_client=server_context.server_client,
+                contents_manager=server_context.contents_manager,
+                kernel_manager=server_context.kernel_manager,
+                notebook_manager=notebook_manager,
+                cell_indices=cell_indices,
+                include_source=include_source,
+            )
         )
-    )
 
 
 @mcp.tool(
@@ -662,8 +694,9 @@ async def delete_cell(
 async def move_cell(
     source_index: Annotated[int, Field(description="Index of the cell to move (0-based)", ge=0)],
     target_index: Annotated[int, Field(description="Destination index where the cell will end up (0-based)", ge=0)],
+    notebook_name: Annotated[str, Field(description="Target notebook name. If omitted, uses the currently active notebook.")] = "",
 ) -> Annotated[str, Field(description="Success message with moved cell info and surrounding context")]:
-    """Move a cell from source_index to target_index within the currently activated notebook.
+    """Move a cell from source_index to target_index. Pass notebook_name to target a specific notebook.
 
     The cell is removed from source_index and placed at target_index. Cells in between shift
     to fill the gap. The cell's type, source, and outputs are preserved.
@@ -671,17 +704,18 @@ async def move_cell(
 
     Use this tool instead of manually deleting and re-inserting a cell — it is atomic and
     preserves cell metadata. Use read_notebook first to see cell indices if needed."""
-    return await safe_notebook_operation(
-        lambda: MoveCellTool().execute(
-            mode=server_context.mode,
-            server_client=server_context.server_client,
-            contents_manager=server_context.contents_manager,
-            kernel_manager=server_context.kernel_manager,
-            notebook_manager=notebook_manager,
-            source_index=source_index,
-            target_index=target_index,
+    with _target_notebook(notebook_manager, notebook_name):
+        return await safe_notebook_operation(
+            lambda: MoveCellTool().execute(
+                mode=server_context.mode,
+                server_client=server_context.server_client,
+                contents_manager=server_context.contents_manager,
+                kernel_manager=server_context.kernel_manager,
+                notebook_manager=notebook_manager,
+                source_index=source_index,
+                target_index=target_index,
+            )
         )
-    )
 
 
 @mcp.tool(

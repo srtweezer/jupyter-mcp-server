@@ -143,6 +143,10 @@ class ExecuteCellTool(BaseTool):
             # Get notebook_path and kernel_id first
             notebook_path, kernel_id = get_current_notebook_context(notebook_manager)
 
+            # Keep the API-relative path for kernel startup (start_kernel's
+            # `path` must be an API path relative to the server root).
+            api_notebook_path = notebook_path
+
             # Resolve to absolute path
             if notebook_path and serverapp and not Path(notebook_path).is_absolute():
                 root_dir = serverapp.root_dir
@@ -152,7 +156,9 @@ class ExecuteCellTool(BaseTool):
             if kernel_id is None:
                 # No kernel available - start a new one on demand
                 logger.info("No kernel_id available, starting new kernel for execute_cell")
-                kernel_id = await kernel_manager.start_kernel()
+                # Pass the notebook path so the kernel's cwd is the notebook's
+                # parent directory (matches native JupyterLab behavior).
+                kernel_id = await kernel_manager.start_kernel(path=api_notebook_path)
 
                 # Wait a bit for kernel to initialize
                 await asyncio.sleep(1.0)

@@ -19,9 +19,14 @@ logger = logging.getLogger(__name__)
 class UseNotebookTool(BaseTool):
     """Tool to use (connect to or create) a notebook file."""
     
-    async def _start_kernel_local(self, kernel_manager: Any):
-        # Start a new kernel using local API
-        kernel_id = await kernel_manager.start_kernel()
+    async def _start_kernel_local(self, kernel_manager: Any, path: Optional[str] = None):
+        # Start a new kernel using local API.
+        # Pass the notebook's API path so the kernel's cwd resolves to the
+        # notebook's parent directory (via MappingKernelManager.cwd_for_path),
+        # matching native JupyterLab behavior. Without this the kernel starts
+        # in the Jupyter server root, breaking relative file access in
+        # notebooks (e.g. open("_experiment_metadata.json")).
+        kernel_id = await kernel_manager.start_kernel(path=path)
         logger.info(f"Started kernel '{kernel_id}', waiting for it to be ready...")
         
         # CRITICAL: Wait for the kernel to actually start and be ready
@@ -212,7 +217,7 @@ class UseNotebookTool(BaseTool):
                         return f"Kernel '{kernel_id}' not found in local kernel manager."
                     kernel = {"id": kernel_id}
                 else:
-                    kernel = await self._start_kernel_local(kernel_manager)
+                    kernel = await self._start_kernel_local(kernel_manager, path=notebook_path)
                     kernel_id = kernel['id']
 
                 info_list.append(f"[INFO] Connected to kernel '{kernel_id}'.")

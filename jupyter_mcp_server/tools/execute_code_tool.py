@@ -181,12 +181,18 @@ class ExecuteCodeTool(BaseTool):
                 if notebook_manager is not None:
                     default_notebook = "default"
                     kernel_info = {"id": kernel_id}
+                    # No path: this entry exists to hold a kernel, and there is
+                    # no notebook behind it. A placeholder here became the
+                    # *active* notebook, so the next insert_cell/read_cell
+                    # resolved to a file nobody had named and failed with an
+                    # errno naming it. Without one they say what is actually
+                    # wrong — that no notebook is open.
                     notebook_manager.add_notebook(
                         default_notebook,
                         kernel_info,
                         server_url="local",
                         token=None,
-                        path="notebook.ipynb"  # Placeholder path
+                        path=None
                     )
                     notebook_manager.set_current_notebook(default_notebook)
             

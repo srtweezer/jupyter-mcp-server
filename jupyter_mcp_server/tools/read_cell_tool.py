@@ -9,7 +9,7 @@ from jupyter_server_client import JupyterServerClient
 from jupyter_mcp_server.tools._base import BaseTool, ServerMode
 from jupyter_mcp_server.notebook_manager import NotebookManager
 from jupyter_mcp_server.models import Notebook
-from jupyter_mcp_server.utils import get_current_notebook_context
+from jupyter_mcp_server.utils import require_notebook_path
 from mcp.types import ImageContent
 
 
@@ -44,13 +44,11 @@ class ReadCellTool(BaseTool):
             Cell information dictionary
         """
         if mode == ServerMode.JUPYTER_SERVER and contents_manager is not None:
-            # Local mode: read notebook directly from file system.
-            # Guard against no active notebook — without this, a None path causes
-            # 'quote_from_bytes() expected bytes' deep in the contents manager.
-            notebook_path, _ = get_current_notebook_context(notebook_manager)
-
-            if not notebook_path:
-                return ["No active notebook. Use the use_notebook tool to activate a notebook first."]
+            # Local mode: read notebook directly from file system. Asking for
+            # the path rather than the context is also what keeps a None out of
+            # the contents manager, where it surfaced as
+            # 'quote_from_bytes() expected bytes'.
+            notebook_path = require_notebook_path(notebook_manager)
 
             model = await contents_manager.get(notebook_path, content=True, type='notebook')
             if 'content' not in model:

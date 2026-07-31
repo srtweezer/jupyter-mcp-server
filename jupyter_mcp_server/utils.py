@@ -56,7 +56,33 @@ def get_current_notebook_context(notebook_manager=None, notebook_name=None):
         if not kernel_id:
             kernel_id = config.runtime_id
 
-    return notebook_path, kernel_id
+    return notebook_path or None, kernel_id
+
+
+def require_notebook_path(notebook_manager=None, notebook_name=None):
+    """The path of the notebook a cell tool should act on.
+
+    Every cell-level tool needs one, and until now they took whatever
+    ``get_current_notebook_context`` returned — including the configured
+    document, including its placeholder default — and handed it to ``open()``.
+    So "no notebook is open" reached the caller as an errno about a file it had
+    never mentioned: ``[Errno 2] No such file or directory: <root>/notebook.ipynb``
+    when the placeholder was a name, ``[Errno 21] Is a directory: <root>`` when
+    it was empty. Neither says what to do; both look like something is broken
+    on the server.
+
+    Raises:
+        ValueError: naming ``use_notebook``, when no notebook is active.
+    """
+    notebook_path, _ = get_current_notebook_context(notebook_manager, notebook_name)
+    if not notebook_path:
+        raise ValueError(
+            "No notebook is active. Call use_notebook(notebook_name=..., "
+            "notebook_path=...) to open or create one first, or pass "
+            "notebook_name to this tool to target a notebook already opened. "
+            "list_notebooks shows which are open."
+        )
+    return notebook_path
 
 
 def extract_output(output: Union[dict, Any]) -> Union[str, ImageContent]:

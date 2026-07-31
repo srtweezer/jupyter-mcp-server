@@ -11,7 +11,7 @@ from typing import Any, Optional
 from jupyter_server_client import JupyterServerClient
 from jupyter_mcp_server.tools._base import BaseTool, ServerMode
 from jupyter_mcp_server.notebook_manager import NotebookManager
-from jupyter_mcp_server.utils import get_current_notebook_context, get_notebook_model, clean_notebook_outputs
+from jupyter_mcp_server.utils import require_notebook_path, get_notebook_model, clean_notebook_outputs
 
 
 class OverwriteCellSourceTool(BaseTool):
@@ -209,7 +209,7 @@ class OverwriteCellSourceTool(BaseTool):
             
             context = get_server_context()
             serverapp = context.serverapp
-            notebook_path, _ = get_current_notebook_context(notebook_manager)
+            notebook_path = require_notebook_path(notebook_manager)
             
             # Resolve to absolute path
             if serverapp and not Path(notebook_path).is_absolute():

@@ -35,7 +35,7 @@ class JupyterMCPServerExtensionApp(ExtensionAppJinjaMixin, ExtensionApp):
     Configuration:
         c.JupyterMCPServerExtensionApp.document_url = "local"  # or http://...
         c.JupyterMCPServerExtensionApp.runtime_url = "local"   # or http://...
-        c.JupyterMCPServerExtensionApp.document_id = "notebook.ipynb"
+        c.JupyterMCPServerExtensionApp.document_id = "notebook.ipynb"  # default: none
         c.JupyterMCPServerExtensionApp.start_new_runtime = True  # Start new kernel
         c.JupyterMCPServerExtensionApp.runtime_id = "kernel-id"  # Or connect to existing
     """
@@ -58,10 +58,18 @@ class JupyterMCPServerExtensionApp(ExtensionAppJinjaMixin, ExtensionApp):
         help='Runtime URL - use "local" for local serverapp access or http://... for remote'
     )
     
+    # Empty rather than a placeholder path, matching JupyterMCPConfig, whose
+    # own default is None. Whatever this holds is auto-enrolled below as the
+    # notebook named "default" and made the *active* one, so a placeholder made
+    # a server that had opened nothing look exactly like one that had: every
+    # cell tool resolved to <root>/notebook.ipynb and failed with
+    # "[Errno 2] No such file or directory", naming a file the caller had never
+    # mentioned, and list_notebooks showed the phantom with a tick beside it.
     document_id = Unicode(
-        "notebook.ipynb",
+        "",
         config=True,
-        help='Default document ID (notebook path)'
+        help='Default document ID (notebook path). Empty means no default '
+             'notebook: the client opens one with use_notebook.'
     )
     
     start_new_runtime = Bool(

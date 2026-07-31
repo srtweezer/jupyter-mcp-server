@@ -16,6 +16,7 @@ from jupyter_mcp_server.hooks import HookEvent, HookRegistry
 from jupyter_mcp_server.tools._base import BaseTool, ServerMode
 from jupyter_mcp_server.utils import (
     get_current_notebook_context,
+    require_notebook_path,
     execute_via_execution_stack,
     safe_extract_outputs,
     get_jupyter_ydoc,
@@ -141,7 +142,8 @@ class ExecuteCellTool(BaseTool):
                 raise ValueError("kernel_manager is required for JUPYTER_SERVER mode")
 
             # Get notebook_path and kernel_id first
-            notebook_path, kernel_id = get_current_notebook_context(notebook_manager)
+            notebook_path = require_notebook_path(notebook_manager)
+            _, kernel_id = get_current_notebook_context(notebook_manager)
 
             # Keep the API-relative path for kernel startup (start_kernel's
             # `path` must be an API path relative to the server root).

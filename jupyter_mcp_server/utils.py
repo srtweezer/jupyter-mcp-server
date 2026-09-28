@@ -455,6 +455,60 @@ async def safe_notebook_operation(operation_func, max_retries=3):
 ###############################################################################
 
 
+#: How long to wait for a kernel to answer before its first execution.
+CLIENT_READY_TIMEOUT_S = 30
+
+
+async def ensure_stack_client_ready(execution_stack, kernel_id: str, logger) -> None:
+    """Make the stack's client for ``kernel_id`` ready before it is first used.
+
+    jupyter-server-nbmodel creates its kernel client lazily and sends the first
+    request straight away. The client's IOPub socket is a ZMQ SUB that only
+    connects when first touched -- inside ``execute_interactive``, just before
+    the request goes out -- and a SUB drops whatever is published before its
+    subscription reaches the kernel (the "slow joiner"). A quick first cell
+    then publishes its output and its closing ``idle`` status into the void,
+    and ``execute_interactive``, which waits for that ``idle`` without a
+    timeout, waits forever. The stack runs one request at a time per kernel,
+    so every later cell on that kernel queues behind it: a notebook whose
+    every execution "times out" although each cell finished at once. Slow
+    cells were spared, because the subscription completes while they run.
+
+    ``wait_for_ready`` is jupyter_client's answer: it repeats ``kernel_info``
+    until the reply arrives *and* IOPub is seen to deliver. Done once per
+    kernel, and again after a restart, while no request is in flight -- the
+    stack's worker only reads the channels during an execution.
+    """
+    from inspect import isawaitable
+    from jupyter_mcp_server.running import registry
+
+    tracked = registry()
+    if kernel_id in tracked.ready or tracked.waited(kernel_id) \
+            or tracked.running(kernel_id):
+        return
+    try:
+        client = execution_stack._get_client(kernel_id)
+        started = client.start_channels()
+        if isawaitable(started):
+            await started
+        ready = client.wait_for_ready(timeout=CLIENT_READY_TIMEOUT_S)
+        if isawaitable(ready):
+            await ready
+        tracked.ready.add(kernel_id)
+    except Exception as error:  # noqa: BLE001 - executing anyway is the old behaviour
+        logger.warning(f"Kernel {kernel_id} did not become ready before its "
+                       f"first execution: {error}")
+
+
+def execution_stack_of(serverapp):
+    """The jupyter-server-nbmodel ExecutionStack, or None without it."""
+    extensions = serverapp.extension_manager.extension_apps.get(
+        "jupyter_server_nbmodel", set())
+    if not extensions:
+        return None
+    return next(iter(extensions))._Extension__execution_stack
+
+
 async def execute_via_execution_stack(
     serverapp: Any,
     kernel_id: str,
@@ -525,6 +579,8 @@ async def execute_via_execution_stack(
         busy = busy_executions(kernel_manager, kernel_id)
         if busy:
             return [busy_message(kernel_id, busy)]
+
+        await ensure_stack_client_ready(execution_stack, kernel_id, logger)
 
         # Submit execution request
         logger.info(f"Submitting execution request to kernel {kernel_id}")

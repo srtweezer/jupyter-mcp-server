@@ -100,6 +100,9 @@ class RunningExecutions:
         self._tasks: Dict[str, asyncio.Task] = {}
         # Executions a tool call is still waiting on: kernel -> token -> start.
         self._waited: Dict[str, Dict[object, float]] = {}
+        # Kernels whose ExecutionStack client has been made ready (see
+        # utils.ensure_stack_client_ready). Forgotten on restart.
+        self.ready: set = set()
 
     @contextmanager
     def waiting(self, kernel_id: str):
@@ -173,6 +176,9 @@ class RunningExecutions:
                             self._finish(execution, "lost", error=(
                                 f"the kernel is {state} but no result arrived; "
                                 f"it was probably restarted or shut down"))
+                            # The stack's worker is still waiting for that
+                            # result, and would hold every later request.
+                            await reset_stack(execution_stack, execution.kernel_id)
                             return
                 await asyncio.sleep(FOLLOW_INTERVAL_S)
             else:
@@ -242,6 +248,7 @@ class RunningExecutions:
     def forget_kernel(self, kernel_id: str, reason: str) -> None:
         """Mark everything followed on ``kernel_id`` lost: it was restarted or
         shut down, and its results will never arrive."""
+        self.ready.discard(kernel_id)
         for execution in list(self._running.get(kernel_id, {}).values()):
             self._finish(execution, "lost", error=reason)
             task = self._tasks.pop(execution.request_id, None)
@@ -299,6 +306,33 @@ def still_running_message(error: StillRunning, partial: List[Any]) -> List[Any]:
     if partial:
         return [head + " Output so far:"] + list(partial)
     return [head + " No output so far."]
+
+
+async def reset_stack(execution_stack: Any, kernel_id: str,
+                      timeout: float = 5.0) -> None:
+    """Drop the ExecutionStack's worker and client for a restarted kernel.
+
+    The worker waits for the ``idle`` status of the request it is executing,
+    without a timeout; a restart kills the code that would have sent it, so
+    the worker waits forever and every later request queues behind it.
+    ``cancel`` discards the worker, its queue and its client, so the next
+    request starts a fresh one (made ready again: ``ready`` is cleared).
+    """
+    registry().ready.discard(kernel_id)
+    if execution_stack is None:
+        return
+    try:
+        await execution_stack.cancel(kernel_id, timeout=timeout)
+    except asyncio.CancelledError:
+        # cancel() awaits the worker it has just cancelled, and awaiting a
+        # cancelled task raises CancelledError here too. That one is expected;
+        # a cancellation of *this* task is not, and must go on.
+        current = asyncio.current_task()
+        if current is not None and current.cancelling():
+            raise
+    except Exception as error:  # noqa: BLE001 - best effort; logged
+        logger.warning("Resetting the execution stack of kernel %s: %s",
+                       kernel_id, error)
 
 
 def busy_executions(kernel_manager: Any, kernel_id: str) -> List[Execution]:

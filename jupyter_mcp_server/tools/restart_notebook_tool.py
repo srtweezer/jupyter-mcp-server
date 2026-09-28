@@ -57,10 +57,16 @@ class RestartNotebookTool(BaseTool):
             try:
                 logger.info(f"Restarting kernel {kernel_id} for notebook '{notebook_name}' in JUPYTER_SERVER mode")
                 await kernel_manager.restart_kernel(kernel_id)
-                # Whatever was followed on it will never report back.
-                from jupyter_mcp_server.running import registry
+                # Whatever was followed on it will never report back, and the
+                # execution stack's worker would wait for it forever.
+                from jupyter_mcp_server.running import registry, reset_stack
+                from jupyter_mcp_server.utils import execution_stack_of
                 registry().forget_kernel(
                     kernel_id, "the kernel was restarted (restart_notebook)")
+                serverapp = getattr(kernel_manager, "parent", None)
+                await reset_stack(
+                    execution_stack_of(serverapp) if serverapp is not None else None,
+                    kernel_id)
                 return f"Notebook '{notebook_name}' kernel restarted successfully. Memory state and imported packages have been cleared."
             except Exception as e:
                 logger.error(f"Failed to restart kernel {kernel_id}: {e}")

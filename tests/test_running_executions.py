@@ -157,6 +157,50 @@ async def test_a_record_the_kernel_contradicts_does_not_refuse_work(monkeypatch)
     assert busy_executions(FakeKernelManager("idle"), "k") == []
 
 
+class ReadyingStack:
+    """Records the order in which the client is readied and requests put."""
+
+    def __init__(self):
+        self.calls = []
+        stack = self
+
+        class Client:
+            def start_channels(self):
+                stack.calls.append("start_channels")
+
+            async def wait_for_ready(self, timeout=None):
+                stack.calls.append("wait_for_ready")
+
+        self.client = Client()
+
+    def _get_client(self, kernel_id):
+        return self.client
+
+    async def cancel(self, kernel_id, timeout=None):
+        self.calls.append("cancel")
+
+
+@pytest.mark.asyncio
+async def test_the_client_is_ready_before_its_first_request_and_only_then(monkeypatch):
+    """The fix for the hang the integration test below cannot provoke on a
+    plain JupyterLab (the race needs the analysis server's timing): the
+    stack's client must see IOPub deliver *before* the first request."""
+    import logging
+    from jupyter_mcp_server.utils import ensure_stack_client_ready
+
+    monkeypatch.setattr(running, "_REGISTRY", RunningExecutions())
+    stack = ReadyingStack()
+    log = logging.getLogger("test")
+
+    await ensure_stack_client_ready(stack, "k", log)
+    await ensure_stack_client_ready(stack, "k", log)
+    assert stack.calls == ["start_channels", "wait_for_ready"], "once per kernel"
+
+    await running.reset_stack(stack, "k")           # a restart
+    await ensure_stack_client_ready(stack, "k", log)
+    assert stack.calls[-3:] == ["cancel", "start_channels", "wait_for_ready"]
+
+
 ###############################################################################
 # Section B — against JupyterLab with the extension
 ###############################################################################
@@ -236,3 +280,40 @@ async def test_interrupt_stops_the_cell_and_keeps_the_variables(lab_client):
 
         after = await lab_client.execute_code("kept + 1", timeout=10)
         assert "42" in _text(after)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(180)
+async def test_a_quick_first_cell_on_a_new_kernel_returns(lab_client):
+    """The stack's client used to subscribe to IOPub as the first request went
+    out; a quick cell published its output and its closing ``idle`` before the
+    subscription arrived, and the stack waited for that ``idle`` forever. On
+    the analysis server every second new notebook hung this way, and every
+    later cell on it queued behind the first."""
+    async with lab_client:
+        for n in range(4):
+            await lab_client.use_notebook(f"quick{n}", NOTEBOOK.replace(".ipynb", f"_{n}.ipynb"),
+                                          mode="create")
+            await lab_client.insert_cell(0, "code", f"print('ready {n}')")
+            result = _text(await lab_client.execute_cell(0, timeout_seconds=15))
+            assert f"ready {n}" in result, f"notebook {n}: {result}"
+    for n in range(4):
+        path = os.path.join("dev", "content", NOTEBOOK.replace(".ipynb", f"_{n}.ipynb"))
+        if os.path.exists(path):
+            os.remove(path)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(120)
+async def test_a_restart_during_a_cell_leaves_the_kernel_usable(lab_client):
+    """The stack's worker was left waiting for the killed cell's ``idle`` and
+    held every later request; restart_notebook now resets it."""
+    async with lab_client:
+        await lab_client.use_notebook("restart", NOTEBOOK, mode="create")
+        await lab_client.insert_cell(0, "code", "import time\ntime.sleep(600)")
+        await lab_client.insert_cell(1, "code", "print('after restart')")
+        first = _text(await lab_client.execute_cell(0, timeout_seconds=2))
+        assert first.startswith(STILL_RUNNING_MARKER), first
+        await lab_client.restart_notebook("restart")
+        after = _text(await lab_client.execute_cell(1, timeout_seconds=30))
+        assert "after restart" in after, after

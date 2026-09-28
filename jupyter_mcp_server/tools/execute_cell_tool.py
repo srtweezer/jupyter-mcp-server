@@ -13,6 +13,7 @@ from typing import Union, List
 from mcp.types import ImageContent
 
 from jupyter_mcp_server.hooks import HookEvent, HookRegistry
+from jupyter_mcp_server.running import StillRunning, still_running_message
 from jupyter_mcp_server.tools._base import BaseTool, ServerMode
 from jupyter_mcp_server.utils import (
     get_current_notebook_context,
@@ -212,14 +213,28 @@ class ExecuteCellTool(BaseTool):
                 document_id = f"json:notebook:{file_id}"
 
                 # Execute with RTC metadata - outputs will sync automatically
-                outputs = await execute_via_execution_stack(
-                    serverapp=serverapp,
-                    kernel_id=kernel_id,
-                    code=code_to_execute,
-                    document_id=document_id,
-                    cell_id=cell_id,
-                    timeout=timeout_seconds
-                )
+                try:
+                    outputs = await execute_via_execution_stack(
+                        serverapp=serverapp,
+                        kernel_id=kernel_id,
+                        code=code_to_execute,
+                        document_id=document_id,
+                        cell_id=cell_id,
+                        timeout=timeout_seconds,
+                        notebook=notebook_manager.get_current_notebook() or "",
+                        cell_index=cell_index,
+                    )
+                except StillRunning as still:
+                    # The stack's worker keeps writing outputs into the shared
+                    # document as they arrive, so the cell already holds what
+                    # has been printed so far.
+                    partial = []
+                    try:
+                        partial = safe_extract_outputs(
+                            ydoc.ycells[cell_index].get("outputs", []))
+                    except Exception:  # noqa: BLE001 - partial output is a bonus
+                        logger.debug("Could not read partial outputs", exc_info=True)
+                    return still_running_message(still, partial)
 
                 return outputs
             else:
@@ -241,13 +256,29 @@ class ExecuteCellTool(BaseTool):
                 if not code_to_execute.strip():
                     return []
 
+                async def write_back(_execution, result):
+                    # The cell finished after the wait: its outputs still
+                    # belong in the file.
+                    raw = result.get("outputs", []) if "error" not in result else []
+                    if isinstance(raw, str):
+                        import json
+                        raw = json.loads(raw)
+                    await self._write_outputs_to_cell(
+                        notebook_path, cell_index, safe_extract_outputs(raw or []))
+
                 # Execute without RTC metadata
-                outputs = await execute_via_execution_stack(
-                    serverapp=serverapp,
-                    kernel_id=kernel_id,
-                    code=code_to_execute,
-                    timeout=timeout_seconds
-                )
+                try:
+                    outputs = await execute_via_execution_stack(
+                        serverapp=serverapp,
+                        kernel_id=kernel_id,
+                        code=code_to_execute,
+                        timeout=timeout_seconds,
+                        notebook=notebook_manager.get_current_notebook() or "",
+                        cell_index=cell_index,
+                        on_done=write_back,
+                    )
+                except StillRunning as still:
+                    return still_running_message(still, [])
 
                 # Write outputs back to file
                 await self._write_outputs_to_cell(notebook_path, cell_index, outputs)

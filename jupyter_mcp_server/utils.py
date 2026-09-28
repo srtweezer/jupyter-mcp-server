@@ -463,7 +463,10 @@ async def execute_via_execution_stack(
     cell_id: str = None,
     timeout: int = 300,
     poll_interval: float = 0.1,
-    logger = None
+    logger = None,
+    notebook: str = "",
+    cell_index: int = None,
+    on_done = None,
 ) -> list[Union[str, ImageContent]]:
     """Execute code using ExecutionStack (JUPYTER_SERVER mode with jupyter-server-nbmodel).
     
@@ -486,8 +489,16 @@ async def execute_via_execution_stack(
         
     Raises:
         RuntimeError: If jupyter-server-nbmodel extension is not installed
-        TimeoutError: If execution exceeds timeout
+        StillRunning: If execution exceeds timeout. The execution is NOT
+            stopped; it is recorded in ``running.registry()`` and followed
+            until it finishes (``on_done`` is then awaited with it).
+
+    An execute on a kernel that is still running a followed execution returns
+    a ``KERNEL_BUSY_MARKER`` refusal instead of queueing behind it.
     """
+    from jupyter_mcp_server.running import (
+        Execution, StillRunning, busy_executions, busy_message,
+        kernel_state_of, registry)
     import logging as default_logging
     
     if logger is None:
@@ -510,12 +521,18 @@ async def execute_via_execution_stack(
                 "cell_id": cell_id
             }
         
+        kernel_manager = getattr(serverapp, "kernel_manager", None)
+        busy = busy_executions(kernel_manager, kernel_id)
+        if busy:
+            return [busy_message(kernel_id, busy)]
+
         # Submit execution request
         logger.info(f"Submitting execution request to kernel {kernel_id}")
         hook_ctx = await HookRegistry.get_instance().fire(
             HookEvent.BEFORE_EXECUTE,
             code=code, kernel_id=kernel_id, metadata=metadata,
         )
+        submitted_at = time.time()
         request_id = execution_stack.put(kernel_id, code, metadata)
         logger.info(f"Execution request {request_id} submitted")
 
@@ -526,77 +543,89 @@ async def execute_via_execution_stack(
         # The try/except ensures we cancel the kernel execution on any
         # abnormal exit.
         start_time = asyncio.get_event_loop().time()
-        try:
-            while True:
-                elapsed = asyncio.get_event_loop().time() - start_time
-                if elapsed > timeout:
-                    raise TimeoutError(f"Execution timed out after {timeout} seconds")
+        # Waited on until this returns or raises: see running.waiting().
+        with registry().waiting(kernel_id):
+            try:
+                while True:
+                    elapsed = asyncio.get_event_loop().time() - start_time
+                    if elapsed > timeout:
+                        raise TimeoutError(f"Execution timed out after {timeout} seconds")
 
-                # Get result (returns None if pending, result dict if complete)
-                result = execution_stack.get(kernel_id, request_id)
+                    # Get result (returns None if pending, result dict if complete)
+                    result = execution_stack.get(kernel_id, request_id)
 
-                if result is not None:
-                    # Execution complete
-                    logger.info(f"Execution request {request_id} completed")
+                    if result is not None:
+                        # Execution complete
+                        logger.info(f"Execution request {request_id} completed")
 
-                    # Check for errors
-                    if "error" in result:
-                        error_info = result["error"]
-                        logger.error(f"Execution error: {error_info}")
-                        error_output = [f"[ERROR: {error_info.get('ename', 'Unknown')}: {error_info.get('evalue', '')}]"]
+                        # Check for errors
+                        if "error" in result:
+                            error_info = result["error"]
+                            logger.error(f"Execution error: {error_info}")
+                            error_output = [f"[ERROR: {error_info.get('ename', 'Unknown')}: {error_info.get('evalue', '')}]"]
+                            await HookRegistry.get_instance().fire(
+                                HookEvent.AFTER_EXECUTE,
+                                code=code, kernel_id=kernel_id, metadata=metadata,
+                                outputs=error_output, error=error_info, context=hook_ctx,
+                            )
+                            return error_output
+
+                        # Check for pending input (shouldn't happen with allow_stdin=False)
+                        if "input_request" in result:
+                            logger.warning("Unexpected input request during execution")
+                            return ["[ERROR: Unexpected input request]"]
+
+                        # Extract outputs
+                        outputs = result.get("outputs", [])
+
+                        # Parse JSON string if needed (ExecutionStack returns JSON string)
+                        if isinstance(outputs, str):
+                            import json
+                            try:
+                                outputs = json.loads(outputs)
+                            except json.JSONDecodeError:
+                                logger.error(f"Failed to parse outputs JSON: {outputs}")
+                                return [f"[ERROR: Invalid output format]"]
+
+                        if outputs:
+                            formatted = safe_extract_outputs(outputs)
+                            logger.info(f"Execution completed with {len(formatted)} formatted outputs: {formatted}")
+                        else:
+                            formatted = []
+                            logger.info("Execution completed with no outputs")
                         await HookRegistry.get_instance().fire(
                             HookEvent.AFTER_EXECUTE,
                             code=code, kernel_id=kernel_id, metadata=metadata,
-                            outputs=error_output, error=error_info, context=hook_ctx,
+                            outputs=formatted, error=None, context=hook_ctx,
                         )
-                        return error_output
+                        return formatted if formatted else ["[No output generated]"]
 
-                    # Check for pending input (shouldn't happen with allow_stdin=False)
-                    if "input_request" in result:
-                        logger.warning("Unexpected input request during execution")
-                        return ["[ERROR: Unexpected input request]"]
+                    # Still pending, wait before next poll
+                    await asyncio.sleep(poll_interval)
 
-                    # Extract outputs
-                    outputs = result.get("outputs", [])
+            except (asyncio.CancelledError, TimeoutError) as stopped_waiting:
+                # The wait is over, the execution is not. This used to call
+                # execution_stack.cancel() without awaiting it -- a coroutine that
+                # never ran -- so the cell kept running while nothing knew about
+                # it. Awaiting it would have been worse: it cancels the stack's
+                # worker (outputs stop reaching the notebook) and leaves the kernel
+                # computing. Stopping is interrupt_kernel's job; here the request
+                # is followed so kernel_status can report it.
+                execution = Execution(
+                    kernel_id=kernel_id, request_id=request_id, notebook=notebook,
+                    cell_index=cell_index, code=code, started_at=submitted_at)
+                registry().follow(
+                    execution_stack, execution, on_done,
+                    kernel_state=(lambda kid: kernel_state_of(kernel_manager, kid))
+                    if kernel_manager is not None else None)
+                logger.info(f"Execution request {request_id} still running on "
+                            f"kernel {kernel_id}; following it")
+                if isinstance(stopped_waiting, asyncio.CancelledError):
+                    raise
+                raise StillRunning(execution, timeout) from None
 
-                    # Parse JSON string if needed (ExecutionStack returns JSON string)
-                    if isinstance(outputs, str):
-                        import json
-                        try:
-                            outputs = json.loads(outputs)
-                        except json.JSONDecodeError:
-                            logger.error(f"Failed to parse outputs JSON: {outputs}")
-                            return [f"[ERROR: Invalid output format]"]
-
-                    if outputs:
-                        formatted = safe_extract_outputs(outputs)
-                        logger.info(f"Execution completed with {len(formatted)} formatted outputs: {formatted}")
-                    else:
-                        formatted = []
-                        logger.info("Execution completed with no outputs")
-                    await HookRegistry.get_instance().fire(
-                        HookEvent.AFTER_EXECUTE,
-                        code=code, kernel_id=kernel_id, metadata=metadata,
-                        outputs=formatted, error=None, context=hook_ctx,
-                    )
-                    return formatted if formatted else ["[No output generated]"]
-
-                # Still pending, wait before next poll
-                await asyncio.sleep(poll_interval)
-
-        except (asyncio.CancelledError, TimeoutError):
-            # Clean up the orphaned execution request to prevent subsequent
-            # execute_cell calls from hanging on stale state.
-            logger.warning(
-                f"Execution request {request_id} interrupted, "
-                f"cancelling kernel {kernel_id} execution"
-            )
-            try:
-                execution_stack.cancel(kernel_id)
-            except Exception as cancel_err:
-                logger.error(f"Failed to cancel execution on kernel {kernel_id}: {cancel_err}")
-            raise
-
+    except StillRunning:
+        raise
     except Exception as e:
         logger.error(f"Error executing via ExecutionStack: {e}", exc_info=True)
         return [f"[ERROR: {str(e)}]"]
@@ -637,6 +666,22 @@ async def execute_code_local(
         import logging
         logger = logging.getLogger(__name__)
     
+    from jupyter_mcp_server.running import busy_executions, busy_message
+
+    busy = busy_executions(getattr(serverapp, "kernel_manager", None), kernel_id)
+    if busy:
+        return [busy_message(kernel_id, busy)]
+
+    from jupyter_mcp_server.running import registry
+
+    with registry().waiting(kernel_id):
+        return await _execute_code_local(serverapp, code, kernel_id, timeout, logger)
+
+
+async def _execute_code_local(serverapp, code, kernel_id, timeout, logger):
+    import zmq.asyncio
+    from inspect import isawaitable
+
     try:
         # Get kernel manager
         kernel_manager = serverapp.kernel_manager
@@ -700,7 +745,17 @@ async def execute_code_local(
             if remaining_ms <= 0:
                 client.stop_channels()
                 logger.warning(f"Code execution timeout after {timeout}s, collected {len(outputs)} outputs")
-                return [f"[TIMEOUT ERROR: Code execution exceeded {timeout} seconds]"]
+                # Stopping the channels stops the listening, not the kernel:
+                # the code runs on, and whatever is run next queues behind it.
+                head = (f"[TIMEOUT ERROR: Code execution exceeded {timeout} seconds] "
+                        f"It was NOT stopped: it is still running on kernel "
+                        f"{kernel_id}, and anything else run in this kernel waits "
+                        f"behind it. Its later output is not collected. "
+                        f"kernel_status says when the kernel is idle again; "
+                        f"interrupt_kernel stops it.")
+                if outputs:
+                    return [head + " Output so far:"] + safe_extract_outputs(outputs)
+                return [head]
             
             # Use shorter poll timeout during grace period
             poll_timeout = min(remaining_ms, grace_period_ms / 2) if execution_done else remaining_ms

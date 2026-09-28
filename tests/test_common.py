@@ -31,6 +31,8 @@ JUPYTER_TOOLS = [
     "use_notebook",
     "list_notebooks", 
     "restart_notebook",
+    "kernel_status",
+    "interrupt_kernel",
     "unuse_notebook",
     "read_notebook",
     # Cell Tools
@@ -382,7 +384,7 @@ class MCPClient:
     async def execute_cell(self, cell_index, timeout_seconds=300, stream=False, progress_interval=5):
         result = await self._call_tool_safe("execute_cell", {
             "cell_index": cell_index,
-            "timeout_seconds": timeout_seconds,
+            "timeout": timeout_seconds,
             "stream": stream,
             "progress_interval": progress_interval
         })

@@ -380,6 +380,43 @@ async def restart_notebook(
 
 @mcp.tool(
     annotations=ToolAnnotations(
+        title="Kernel Status",
+        readOnlyHint=True,
+    ),
+)
+@with_hooks("kernel_status")
+async def kernel_status(
+    notebook_name: Annotated[str, Field(description="Notebook identifier. If omitted, the active notebook.")] = "",
+) -> Annotated[str, Field(description="JSON: execution_state, the executions still running, and the last ones that finished with their outputs")]:
+    """Whether a notebook's kernel is busy, with what, and what finished.
+
+    A cell whose execute_cell wait ran out keeps running; it is listed under
+    `running` until it ends, then under `finished` with its outputs."""
+    from jupyter_mcp_server.tools.kernel_control_tool import kernel_status as status
+    return status(server_context.mode, notebook_manager,
+                  server_context.kernel_manager, notebook_name)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Interrupt Kernel",
+        destructiveHint=False,
+    ),
+)
+@with_hooks("interrupt_kernel")
+async def interrupt_kernel(
+    notebook_name: Annotated[str, Field(description="Notebook identifier. If omitted, the active notebook.")] = "",
+) -> Annotated[str, Field(description="JSON: what was stopped and the kernel's state afterwards")]:
+    """Interrupt the code running in a notebook's kernel (KeyboardInterrupt).
+
+    Variables and imports are kept, unlike restart_notebook."""
+    from jupyter_mcp_server.tools.kernel_control_tool import interrupt_kernel as interrupt
+    return await interrupt(server_context.mode, notebook_manager,
+                           server_context.kernel_manager, notebook_name)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
         title="Unuse Notebook",
         destructiveHint=True,
     ),

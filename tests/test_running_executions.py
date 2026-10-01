@@ -201,6 +201,68 @@ async def test_the_client_is_ready_before_its_first_request_and_only_then(monkey
     assert stack.calls[-3:] == ["cancel", "start_channels", "wait_for_ready"]
 
 
+@pytest.mark.asyncio
+async def test_resetting_a_stuck_stack_with_a_queued_request_is_quiet(monkeypatch, caplog):
+    """The real ExecutionStack, as on 2026-10-01: one request stuck before
+    the kernel saw it, a retry queued behind it, then the follower's reset.
+    nbmodel's worker drains its queue on cancel with ``task_done()`` alone,
+    which never empties it, so the drain ends in ``ValueError: task_done()
+    called too many times`` -- after ``cancel()`` has dropped the worker,
+    queue and client all the same. That is the reset working, not failing,
+    and it must not be logged as a failure."""
+    import logging
+    from jupyter_server_nbmodel.execution_stack import ExecutionStack
+
+    monkeypatch.setattr(running, "_REGISTRY", RunningExecutions())
+
+    class Client:
+        session = type("Session", (), {"session": ""})()
+        allow_stdin = False
+        stopped = False
+
+        async def execute_interactive(self, *args, **kwargs):
+            await asyncio.Event().wait()            # the idle that never comes
+
+        def stop_channels(self):
+            Client.stopped = True
+
+    class Manager:
+        def get_kernel(self, kernel_id):
+            return type("Kernel", (), {"client": lambda self: Client()})()
+
+    stack = ExecutionStack(Manager(), None)
+    stuck = stack.put("k", "cell 4")
+    retry = stack.put("k", "cell 4 again")
+    await asyncio.sleep(0.05)                       # the worker takes `stuck`
+    assert stack.get("k", stuck) is None and stack.get("k", retry) is None
+
+    with caplog.at_level(logging.DEBUG, logger="jupyter_mcp_server.running"):
+        await running.reset_stack(stack, "k", timeout=1.0)
+
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING], \
+        caplog.text
+    assert Client.stopped, "the stuck client is discarded"
+    fresh = stack.put("k", "next")                  # a new worker, not the dead one
+    await asyncio.sleep(0.05)
+    assert stack.get("k", fresh) is None            # taken, and stuck in the stub
+    await running.reset_stack(stack, "k", timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_any_other_reset_failure_is_still_a_warning(monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setattr(running, "_REGISTRY", RunningExecutions())
+
+    class Stack:
+        async def cancel(self, kernel_id, timeout=None):
+            raise ValueError("something else")
+
+    with caplog.at_level(logging.WARNING, logger="jupyter_mcp_server.running"):
+        await running.reset_stack(Stack(), "k")
+    assert "something else" in caplog.text
+
+
 ###############################################################################
 # Section B — against JupyterLab with the extension
 ###############################################################################

@@ -330,6 +330,17 @@ async def reset_stack(execution_stack: Any, kernel_id: str,
         current = asyncio.current_task()
         if current is not None and current.cancelling():
             raise
+    except ValueError as error:
+        # The cancelled worker drains its queue with task_done() alone, which
+        # never empties it, so with a request queued behind the stuck one the
+        # drain overshoots and raises. cancel() has still dropped the worker,
+        # queue and client in its finally blocks: the reset worked.
+        if "task_done" not in str(error):
+            logger.warning("Resetting the execution stack of kernel %s: %s",
+                           kernel_id, error)
+        else:
+            logger.debug("Execution stack of kernel %s reset (%s)",
+                         kernel_id, error)
     except Exception as error:  # noqa: BLE001 - best effort; logged
         logger.warning("Resetting the execution stack of kernel %s: %s",
                        kernel_id, error)

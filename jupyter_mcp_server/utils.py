@@ -548,11 +548,14 @@ async def execute_via_execution_stack(
             until it finishes (``on_done`` is then awaited with it).
 
     An execute on a kernel that is still running a followed execution returns
-    a ``KERNEL_BUSY_MARKER`` refusal instead of queueing behind it.
+    a ``KERNEL_BUSY_MARKER`` refusal instead of queueing behind it. One the
+    kernel shows no sign of receiving (``NOT_STARTED_AFTER_S``) is dropped and
+    reset by ``drop_if_never_started``, and returns ``NOT_STARTED_MARKER``.
     """
     from jupyter_mcp_server.running import (
-        Execution, StillRunning, busy_executions, busy_message,
-        kernel_state_of, registry)
+        NOT_STARTED, NOT_STARTED_AFTER_S, Execution, StillRunning,
+        busy_executions, busy_message, drop_if_never_started, kernel_state_of,
+        not_started_message, quiet_since, registry)
     import logging as default_logging
     
     if logger is None:
@@ -599,6 +602,8 @@ async def execute_via_execution_stack(
         # The try/except ensures we cancel the kernel execution on any
         # abnormal exit.
         start_time = asyncio.get_event_loop().time()
+        # Asked at most once per wait: the kernel_info probe costs a client.
+        probed = False
         # Waited on until this returns or raises: see running.waiting().
         with registry().waiting(kernel_id):
             try:
@@ -617,8 +622,14 @@ async def execute_via_execution_stack(
                         # Check for errors
                         if "error" in result:
                             error_info = result["error"]
+                            if not isinstance(error_info, dict):
+                                error_info = {"evalue": str(error_info)}
                             logger.error(f"Execution error: {error_info}")
-                            error_output = [f"[ERROR: {error_info.get('ename', 'Unknown')}: {error_info.get('evalue', '')}]"]
+                            if error_info.get("ename") == NOT_STARTED:
+                                error_output = [not_started_message(
+                                    cell_index, error_info.get("evalue", ""))]
+                            else:
+                                error_output = [f"[ERROR: {error_info.get('ename', 'Unknown')}: {error_info.get('evalue', '')}]"]
                             await HookRegistry.get_instance().fire(
                                 HookEvent.AFTER_EXECUTE,
                                 code=code, kernel_id=kernel_id, metadata=metadata,
@@ -656,6 +667,16 @@ async def execute_via_execution_stack(
                         )
                         return formatted if formatted else ["[No output generated]"]
 
+                    # Pending this long with the kernel idle and untouched: the
+                    # stack never sent it. Dropping it answers it (and anything
+                    # queued behind it), which the next poll reads.
+                    if (not probed and elapsed >= NOT_STARTED_AFTER_S
+                            and quiet_since(kernel_manager, kernel_id, submitted_at)):
+                        probed = True
+                        await drop_if_never_started(
+                            execution_stack, kernel_manager, kernel_id, submitted_at)
+                        continue
+
                     # Still pending, wait before next poll
                     await asyncio.sleep(poll_interval)
 
@@ -673,7 +694,8 @@ async def execute_via_execution_stack(
                 registry().follow(
                     execution_stack, execution, on_done,
                     kernel_state=(lambda kid: kernel_state_of(kernel_manager, kid))
-                    if kernel_manager is not None else None)
+                    if kernel_manager is not None else None,
+                    kernel_manager=kernel_manager)
                 logger.info(f"Execution request {request_id} still running on "
                             f"kernel {kernel_id}; following it")
                 if isinstance(stopped_waiting, asyncio.CancelledError):

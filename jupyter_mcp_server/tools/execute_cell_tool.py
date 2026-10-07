@@ -13,7 +13,8 @@ from typing import Union, List
 from mcp.types import ImageContent
 
 from jupyter_mcp_server.hooks import HookEvent, HookRegistry
-from jupyter_mcp_server.running import StillRunning, still_running_message
+from jupyter_mcp_server.running import (
+    KERNEL_BUSY_MARKER, NOT_STARTED_MARKER, StillRunning, still_running_message)
 from jupyter_mcp_server.tools._base import BaseTool, ServerMode
 from jupyter_mcp_server.utils import (
     get_current_notebook_context,
@@ -279,6 +280,10 @@ class ExecuteCellTool(BaseTool):
                     )
                 except StillRunning as still:
                     return still_running_message(still, [])
+
+                if outputs and isinstance(outputs[0], str) and outputs[0].startswith(
+                        (NOT_STARTED_MARKER, KERNEL_BUSY_MARKER)):
+                    return outputs      # nothing ran: the cell keeps its outputs
 
                 # Write outputs back to file
                 await self._write_outputs_to_cell(notebook_path, cell_index, outputs)

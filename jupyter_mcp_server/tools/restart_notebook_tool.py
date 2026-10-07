@@ -66,7 +66,8 @@ class RestartNotebookTool(BaseTool):
                 serverapp = getattr(kernel_manager, "parent", None)
                 await reset_stack(
                     execution_stack_of(serverapp) if serverapp is not None else None,
-                    kernel_id)
+                    kernel_id, reason="the kernel was restarted (restart_notebook) "
+                                      "before the request finished.")
                 return f"Notebook '{notebook_name}' kernel restarted successfully. Memory state and imported packages have been cleared."
             except Exception as e:
                 logger.error(f"Failed to restart kernel {kernel_id}: {e}")

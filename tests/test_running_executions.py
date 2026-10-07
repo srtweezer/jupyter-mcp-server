@@ -17,13 +17,15 @@ the MCP_SERVER mode keeps its own timeout path).
 import asyncio
 import json
 import os
+import time
+from datetime import datetime, timezone
 
 import pytest
 
 from jupyter_mcp_server import running
 from jupyter_mcp_server.running import (
-    Execution, KERNEL_BUSY_MARKER, RunningExecutions, STILL_RUNNING_MARKER,
-    busy_executions)
+    Execution, KERNEL_BUSY_MARKER, NOT_STARTED_MARKER, RunningExecutions,
+    STILL_RUNNING_MARKER, busy_executions)
 
 
 ###############################################################################
@@ -261,6 +263,195 @@ async def test_any_other_reset_failure_is_still_a_warning(monkeypatch, caplog):
     with caplog.at_level(logging.WARNING, logger="jupyter_mcp_server.running"):
         await running.reset_stack(Stack(), "k")
     assert "something else" in caplog.text
+
+
+# -- a request the kernel never received (2026-10-01, 2026-10-06) ------------
+#
+# nbmodel's worker held a cell without sending it; the idle kernel showed
+# nothing, the cell "timed out" after 120 s, a retry queued behind it waited
+# out its own 280 s for a request the follower's reset had already discarded,
+# and the follower called the kernel "probably restarted". It was not.
+
+class StuckClient:
+    """The stack's client for a request it never sends."""
+    session = type("Session", (), {"session": ""})()
+    allow_stdin = False
+
+    def __init__(self, on_stop=None):
+        self.on_stop = on_stop
+
+    async def execute_interactive(self, *args, **kwargs):
+        await asyncio.Event().wait()
+
+    def stop_channels(self):
+        if self.on_stop is not None:
+            self.on_stop()
+
+
+def stuck_stack(on_stop=None):
+    """The real ExecutionStack, whose worker holds whatever it is given."""
+    from jupyter_server_nbmodel.execution_stack import ExecutionStack
+
+    class Manager:
+        def get_kernel(self, kernel_id):
+            return type("Kernel", (), {
+                "client": lambda self: StuckClient(on_stop)})()
+
+    return ExecutionStack(Manager(), None)
+
+
+class Kernels:
+    """The server's kernel manager: one kernel, last active at ``last``
+    (epoch s), in ``state``, answering kernel_info unless ``answers`` is false."""
+
+    def __init__(self, last, answers=True, state="idle"):
+        self.probes = 0
+        kernels = self
+
+        class Probe:
+            def start_channels(self):
+                pass
+
+            async def wait_for_ready(self, timeout=None):
+                kernels.probes += 1
+                if not answers:
+                    raise RuntimeError("Kernel didn't respond in 5 seconds")
+
+            def stop_channels(self):
+                pass
+
+        self.kernel = type("Kernel", (), {})()
+        self.kernel.execution_state = state
+        self.kernel.last_activity = datetime.fromtimestamp(last, timezone.utc)
+        self.kernel.client = lambda: Probe()
+
+    def get_kernel(self, kernel_id):
+        return self.kernel
+
+    def touch(self):
+        self.kernel.last_activity = datetime.now(timezone.utc)
+
+
+def serverapp_for(stack, kernels):
+    extension = type("Extension", (), {})()
+    setattr(extension, "_Extension__execution_stack", stack)
+    app = type("ServerApp", (), {})()
+    app.extension_manager = type("ExtensionManager", (), {
+        "extension_apps": {"jupyter_server_nbmodel": {extension}}})()
+    app.kernel_manager = kernels
+    return app
+
+
+@pytest.fixture
+def quick_check(monkeypatch):
+    monkeypatch.setattr(running, "NOT_STARTED_AFTER_S", 0.2)
+    monkeypatch.setattr(running, "SETTLE_S", 0.01)
+    registry = RunningExecutions()
+    registry.ready.add("k")                 # the client was readied long ago
+    monkeypatch.setattr(running, "_REGISTRY", registry)
+    return registry
+
+
+@pytest.mark.asyncio
+async def test_a_reset_answers_every_request_it_dropped(monkeypatch):
+    """cancel() discards the queue but keeps the entries, which read as
+    pending forever: whoever waited on one waited out its whole timeout."""
+    monkeypatch.setattr(running, "_REGISTRY", RunningExecutions())
+    stack = stuck_stack()
+    stuck = stack.put("k", "cell 2")
+    queued = stack.put("k", "cell 3")
+    await asyncio.sleep(0.05)
+
+    await running.reset_stack(stack, "k", timeout=1.0, reason="restarted.")
+
+    for uid in (stuck, queued):
+        assert stack.get("k", uid) == {
+            "error": {"ename": running.DROPPED, "evalue": "restarted."}}, uid
+
+
+@pytest.mark.asyncio
+async def test_a_request_the_kernel_never_received_says_so_in_seconds(quick_check):
+    """Both the stuck cell and the one queued behind it come back promptly,
+    marked as never started, instead of 'still running' after the timeout."""
+    from jupyter_mcp_server.utils import execute_via_execution_stack
+
+    stack, kernels = stuck_stack(), Kernels(last=time.time() - 60)
+    app = serverapp_for(stack, kernels)
+    started = time.time()
+    first, second = await asyncio.gather(
+        execute_via_execution_stack(app, "k", "load()", timeout=60, cell_index=2),
+        execute_via_execution_stack(app, "k", "fit()", timeout=60, cell_index=3))
+
+    assert time.time() - started < 5
+    assert first[0].startswith(NOT_STARTED_MARKER + " Cell 2"), first
+    assert second[0].startswith(NOT_STARTED_MARKER + " Cell 3"), second
+    assert "received nothing" in first[0] and "safe to run it again" in first[0]
+    assert kernels.probes == 1, "one drop answers both"
+    assert quick_check.running("k") == [], "nothing left to follow"
+    assert "k" not in quick_check.ready, "the next request readies a new client"
+
+
+@pytest.mark.asyncio
+async def test_a_kernel_that_was_sent_something_is_not_called_never_started(quick_check):
+    from jupyter_mcp_server.utils import execute_via_execution_stack
+
+    stack = stuck_stack()
+    kernels = Kernels(last=time.time() + 3600)      # active after the submit
+    with pytest.raises(running.StillRunning):
+        await execute_via_execution_stack(serverapp_for(stack, kernels), "k",
+                                          "load()", timeout=0.5, cell_index=2)
+    assert kernels.probes == 0
+
+    await _until(lambda: quick_check.finished("k"), limit=10)   # its reset
+    lost = quick_check.finished("k")[0]
+    assert lost.status == "lost" and "received nothing" not in lost.error
+    assert "restarted or shut down" in lost.error
+
+
+@pytest.mark.asyncio
+async def test_a_kernel_that_does_not_answer_is_not_called_never_started(quick_check):
+    """Idle and silent is also what a frozen kernel looks like, and a request
+    sent to it would still run once it thaws."""
+    from jupyter_mcp_server.utils import execute_via_execution_stack
+
+    stack, kernels = stuck_stack(), Kernels(last=time.time() - 60, answers=False)
+    with pytest.raises(running.StillRunning):
+        await execute_via_execution_stack(serverapp_for(stack, kernels), "k",
+                                          "load()", timeout=0.5, cell_index=2)
+    assert kernels.probes == 1, "asked once per wait"
+    await _until(lambda: quick_check.finished("k"), limit=10)
+    assert "received nothing" not in quick_check.finished("k")[0].error
+
+
+@pytest.mark.asyncio
+async def test_the_follower_tells_a_request_never_sent_from_a_restart(quick_check):
+    """The follower's verdict once the caller has stopped waiting: what it
+    used to call 'probably restarted or shut down'."""
+    stack = stuck_stack()
+    uid = stack.put("k", "load()")
+    execution = Execution("k", uid, cell_index=2)
+    quick_check.follow(stack, execution, kernel_state=lambda kid: "idle",
+                       kernel_manager=Kernels(last=time.time() - 60))
+
+    await _until(lambda: quick_check.finished("k"), limit=10)
+    lost = quick_check.finished("k")[0]
+    assert lost.status == "lost" and "received nothing" in lost.error
+    assert "restarted" not in lost.error
+
+
+@pytest.mark.asyncio
+async def test_a_request_that_slips_out_during_the_reset_is_not_called_unstarted(quick_check):
+    """If the kernel becomes active as the worker is cancelled, the request
+    may have gone out at the last moment: 'nothing ran' would be a guess."""
+    from jupyter_mcp_server.utils import execute_via_execution_stack
+
+    kernels = Kernels(last=time.time() - 60)
+    stack = stuck_stack(on_stop=kernels.touch)
+    answer = await execute_via_execution_stack(
+        serverapp_for(stack, kernels), "k", "load()", timeout=60, cell_index=2)
+
+    assert not answer[0].startswith(NOT_STARTED_MARKER), answer
+    assert running.DROPPED in answer[0] and "may have reached it" in answer[0]
 
 
 ###############################################################################

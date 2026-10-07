@@ -50,6 +50,22 @@ IDLE_WITHOUT_RESULT_S = 30.0
 #: Text output kept per finished execution. Images are counted, not kept.
 OUTPUT_CHARS_KEPT = 20_000
 
+#: A request the kernel has shown no sign of receiving for this long, while it
+#: sits idle and answers ``kernel_info``, is held in the execution stack.
+NOT_STARTED_AFTER_S = 10.0
+
+#: How long the kernel gets to answer ``kernel_info`` in that check.
+PROBE_TIMEOUT_S = 5.0
+
+#: After a reset, how long a request that slipped out just before it has to
+#: show up as kernel activity.
+SETTLE_S = 0.5
+
+#: ``ename`` of the result a reset gives each request it drops: one the kernel
+#: never received, and one it may have (a restart, a reset for any other reason).
+NOT_STARTED = "NotStarted"
+DROPPED = "ExecutionDropped"
+
 
 @dataclass
 class Execution:
@@ -128,25 +144,28 @@ class RunningExecutions:
 
     def follow(self, execution_stack: Any, execution: Execution,
                on_done: Optional[Callable[[Execution, Any], Awaitable[None]]] = None,
-               kernel_state: Optional[Callable[[str], str]] = None) -> None:
+               kernel_state: Optional[Callable[[str], str]] = None,
+               kernel_manager: Any = None) -> None:
         """Record ``execution`` and collect its result when it arrives.
 
         ``on_done`` receives the execution and the stack's raw result, for a
         caller that must still do something with the outputs (file mode writes
         them back into the notebook). ``kernel_state`` maps a kernel id to its
         execution state; with it, a kernel that sits idle with no result
-        arriving ends the follow (see ``IDLE_WITHOUT_RESULT_S``).
+        arriving ends the follow (see ``IDLE_WITHOUT_RESULT_S``), and with
+        ``kernel_manager`` too the follow says whether the kernel ever
+        received the request (see ``drop_if_never_started``).
         """
         kernel = execution.kernel_id
         self._running.setdefault(kernel, {})[execution.request_id] = execution
-        task = asyncio.ensure_future(
-            self._collect(execution_stack, execution, on_done, kernel_state))
+        task = asyncio.ensure_future(self._collect(
+            execution_stack, execution, on_done, kernel_state, kernel_manager))
         self._tasks[execution.request_id] = task
         task.add_done_callback(
             lambda _t, rid=execution.request_id: self._tasks.pop(rid, None))
 
     async def _collect(self, execution_stack: Any, execution: Execution,
-                       on_done, kernel_state=None) -> None:
+                       on_done, kernel_state=None, kernel_manager=None) -> None:
         result = None
         deadline = time.time() + FOLLOW_LIMIT_S
         idle_since = None
@@ -173,20 +192,34 @@ class RunningExecutions:
                         idle_since = idle_since or time.time()
                         if (state == "missing"
                                 or time.time() - idle_since > IDLE_WITHOUT_RESULT_S):
-                            self._finish(execution, "lost", error=(
-                                f"the kernel is {state} but no result arrived; "
-                                f"it was probably restarted or shut down"))
-                            # The stack's worker is still waiting for that
-                            # result, and would hold every later request.
-                            await reset_stack(execution_stack, execution.kernel_id)
-                            return
+                            # The stack's worker is still waiting, and would
+                            # hold every later request: reset it, which also
+                            # answers every request it held, this one included.
+                            reason = None
+                            if state != "missing" and kernel_manager is not None:
+                                reason = await drop_if_never_started(
+                                    execution_stack, kernel_manager,
+                                    execution.kernel_id, execution.started_at)
+                            if reason is None:
+                                reason = (f"the kernel is {state} and no result "
+                                          f"arrived: it was restarted or shut "
+                                          f"down, does not answer, or its reply "
+                                          f"never reached the server's execution "
+                                          f"queue")
+                                await reset_stack(execution_stack,
+                                                  execution.kernel_id, reason=reason)
+                            result = _take(execution_stack, execution)
+                            if result is None:
+                                self._finish(execution, "lost", error=reason)
+                                return
+                            break
                 await asyncio.sleep(FOLLOW_INTERVAL_S)
             else:
                 self._finish(execution, "lost",
                              error="no longer followed (running too long)")
                 return
             self._finish_with(execution, result)
-            if on_done is not None:
+            if on_done is not None and execution.status != "lost":
                 try:
                     await on_done(execution, result)
                 except Exception:  # noqa: BLE001 - reporting must not die
@@ -204,6 +237,12 @@ class RunningExecutions:
 
         if "error" in result:
             info = result["error"] or {}
+            if not isinstance(info, dict):          # nbmodel's own: a bare string
+                info = {"evalue": str(info)}
+            if info.get("ename") in (NOT_STARTED, DROPPED):
+                # Dropped by a reset: the stack no longer has it.
+                self._finish(execution, "lost", error=info.get("evalue", ""))
+                return
             error = f"{info.get('ename', 'Error')}: {info.get('evalue', '')}"
             self._finish(execution, "error", error=error)
             return
@@ -290,6 +329,10 @@ STILL_RUNNING_MARKER = "[STILL RUNNING]"
 #: The first characters of a refusal to queue behind a running execution.
 KERNEL_BUSY_MARKER = "[KERNEL BUSY]"
 
+#: The first characters of a result that says the kernel never received the
+#: request, so nothing ran. A client may test for it; keep it stable.
+NOT_STARTED_MARKER = "[NOT STARTED]"
+
 
 def still_running_message(error: StillRunning, partial: List[Any]) -> List[Any]:
     """The tool result for a cell that outlived its wait."""
@@ -308,8 +351,15 @@ def still_running_message(error: StillRunning, partial: List[Any]) -> List[Any]:
     return [head + " No output so far."]
 
 
+def not_started_message(cell_index: Optional[int], reason: str) -> str:
+    """The tool result for an execution the kernel never received."""
+    where = f"Cell {cell_index}" if cell_index is not None else "The code"
+    return (f"{NOT_STARTED_MARKER} {where} did not run: {reason} Nothing ran, "
+            f"so it is safe to run it again.")
+
+
 async def reset_stack(execution_stack: Any, kernel_id: str,
-                      timeout: float = 5.0) -> None:
+                      timeout: float = 5.0, reason: str = "") -> None:
     """Drop the ExecutionStack's worker and client for a restarted kernel.
 
     The worker waits for the ``idle`` status of the request it is executing,
@@ -317,10 +367,194 @@ async def reset_stack(execution_stack: Any, kernel_id: str,
     the worker waits forever and every later request queues behind it.
     ``cancel`` discards the worker, its queue and its client, so the next
     request starts a fresh one (made ready again: ``ready`` is cleared).
+
+    Every request the stack still held is answered with a ``DROPPED`` error
+    naming ``reason``. ``cancel`` keeps their entries, which then read as
+    pending forever: on 2026-10-06 a cell queued behind a stuck one waited out
+    its whole 280 s for a request the reset had already discarded.
     """
     registry().ready.discard(kernel_id)
     if execution_stack is None:
         return
+    held = _pending(execution_stack, kernel_id)
+    try:
+        await _cancel(execution_stack, kernel_id, timeout)
+    finally:
+        _answer(execution_stack, kernel_id, held, DROPPED, reason or (
+            "the server's execution queue for this kernel was reset before "
+            "the request finished."))
+
+
+async def drop_if_never_started(execution_stack: Any, kernel_manager: Any,
+                                kernel_id: str, since: float,
+                                timeout: float = 1.0) -> Optional[str]:
+    """Reset the stack if the kernel never received what was submitted at ``since``.
+
+    The case of 2026-10-01 and 2026-10-06: nbmodel's worker held a request
+    without ever sending it, the kernel sat idle, and the request "timed out"
+    as if the cell were slow; the next one queued behind it. A kernel that is
+    idle, has done nothing tracked since ``since`` and answers ``kernel_info``
+    now (so it is reading its shell socket) was never sent the request.
+
+    ``timeout`` bounds the reset, whose wait for the held request's queue
+    entry always runs out (see ``_cancel``): kept short, since the caller waits.
+
+    Returns the reason every held request was answered with, or None when
+    that cannot be shown (nothing is done then). Each request is answered
+    ``NOT_STARTED``, unless the kernel became active while the worker was
+    being cancelled: the request may have gone out at the last moment, and is
+    answered ``DROPPED`` with a reason that says so.
+    """
+    if execution_stack is None or kernel_id in _DROPPING \
+            or not quiet_since(kernel_manager, kernel_id, since):
+        return None
+    # A request queued behind the stuck one reaches here too; one drop answers
+    # both, so the second leaves it to the first.
+    _DROPPING.add(kernel_id)
+    try:
+        return await _drop_if_never_started(execution_stack, kernel_manager,
+                                            kernel_id, since, timeout)
+    finally:
+        _DROPPING.discard(kernel_id)
+
+
+#: Kernels a ``drop_if_never_started`` is at work on.
+_DROPPING: set = set()
+
+
+async def _drop_if_never_started(execution_stack, kernel_manager, kernel_id,
+                                 since, timeout) -> Optional[str]:
+    if not await kernel_answers(kernel_manager, kernel_id):
+        return None
+    if not quiet_since(kernel_manager, kernel_id, since):
+        return None
+    registry().ready.discard(kernel_id)
+    waited = time.time() - since
+    held = _pending(execution_stack, kernel_id)
+    try:
+        await _cancel(execution_stack, kernel_id, timeout)
+    except asyncio.CancelledError:
+        _answer(execution_stack, kernel_id, held, DROPPED,
+                "the server's execution queue for this kernel was reset.")
+        raise
+    await asyncio.sleep(SETTLE_S)
+    if quiet_since(kernel_manager, kernel_id, since):
+        reason = (f"kernel {kernel_id} received nothing in the {waited:.0f} s "
+                  f"after it was submitted, while idle and answering: the "
+                  f"server's execution queue held it and never sent it. The "
+                  f"queue has been reset.")
+        _answer(execution_stack, kernel_id, held, NOT_STARTED, reason)
+    else:
+        reason = (f"the server's execution queue for kernel {kernel_id} held "
+                  f"this request for {waited:.0f} s while the kernel sat idle, "
+                  f"and was reset; the kernel became active just as it was, so "
+                  f"the request may have reached it at the last moment and "
+                  f"be running with nobody collecting its output. Check "
+                  f"kernel_status before running it again.")
+        _answer(execution_stack, kernel_id, held, DROPPED, reason)
+    return reason
+
+
+def quiet_since(kernel_manager: Any, kernel_id: str, since: float) -> bool:
+    """The kernel is idle and has done nothing tracked since ``since`` (epoch s).
+
+    jupyter_server moves ``last_activity`` on every IOPub message answering a
+    tracked request, an execute among them, so a kernel sent an execute after
+    ``since`` cannot pass. ``kernel_info`` is untracked: asking the kernel
+    whether it answers does not move it.
+    """
+    if kernel_manager is None:
+        return False
+    try:
+        kernel = kernel_manager.get_kernel(kernel_id)
+    except KeyError:
+        return False
+    if getattr(kernel, "execution_state", None) != "idle":
+        return False
+    last = getattr(kernel, "last_activity", None)
+    return last is not None and last.timestamp() < since
+
+
+async def kernel_answers(kernel_manager: Any, kernel_id: str,
+                         timeout: Optional[float] = None) -> bool:
+    """Whether the kernel answers ``kernel_info`` within ``timeout``, on a
+    client of its own: alive, and reading what is sent to it."""
+    from inspect import isawaitable
+
+    timeout = PROBE_TIMEOUT_S if timeout is None else timeout
+    try:
+        client = kernel_manager.get_kernel(kernel_id).client()
+    except Exception:  # noqa: BLE001 - no kernel, no answer
+        return False
+    try:
+        started = client.start_channels()
+        if isawaitable(started):
+            await started
+        ready = client.wait_for_ready(timeout=timeout)
+        if isawaitable(ready):
+            await ready
+        return True
+    except Exception:  # noqa: BLE001 - no answer is the answer
+        return False
+    finally:
+        try:
+            client.stop_channels()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _results_of(execution_stack: Any, kernel_id: str) -> Dict[str, Any]:
+    """nbmodel's result table for ``kernel_id`` (request id -> result).
+
+    Private to the stack, and reached as ``utils.execution_stack_of`` reaches
+    the stack itself; an nbmodel without it gives an empty table.
+    """
+    table = getattr(execution_stack, "_ExecutionStack__execution_results", None)
+    return table.get(kernel_id, {}) if isinstance(table, dict) else {}
+
+
+def _pending(execution_stack: Any, kernel_id: str) -> List[str]:
+    """The requests on ``kernel_id`` the stack has no result for yet."""
+    try:
+        from jupyter_server_nbmodel.execution_stack import NO_RESULT
+    except ImportError:
+        return []
+    return [uid for uid, result in _results_of(execution_stack, kernel_id).items()
+            if result is NO_RESULT]
+
+
+def _answer(execution_stack: Any, kernel_id: str, uids: List[str],
+            ename: str, reason: str) -> None:
+    """Give each of ``uids`` that is still unanswered an error result.
+
+    The cancelled worker's own answer to the request it held, a bare string
+    (``{"error": "CancelledError()"}``), counts as unanswered: read as an
+    error it says nothing.
+    """
+    try:
+        from jupyter_server_nbmodel.execution_stack import NO_RESULT
+    except ImportError:
+        return
+    results = _results_of(execution_stack, kernel_id)
+    for uid in uids:
+        if uid not in results:
+            continue
+        current = results[uid]
+        if current is NO_RESULT or (isinstance(current, dict)
+                                    and isinstance(current.get("error"), str)):
+            results[uid] = {"error": {"ename": ename, "evalue": reason}}
+
+
+def _take(execution_stack: Any, execution: Execution) -> Any:
+    """The stack's result for ``execution`` (read once), or None."""
+    try:
+        return execution_stack.get(execution.kernel_id, execution.request_id)
+    except ValueError:
+        return None
+
+
+async def _cancel(execution_stack: Any, kernel_id: str, timeout: float) -> None:
+    """``ExecutionStack.cancel``, with what it raises on success absorbed."""
     try:
         await execution_stack.cancel(kernel_id, timeout=timeout)
     except asyncio.CancelledError:
@@ -341,6 +575,12 @@ async def reset_stack(execution_stack: Any, kernel_id: str,
         else:
             logger.debug("Execution stack of kernel %s reset (%s)",
                          kernel_id, error)
+    except TimeoutError:
+        # With nothing queued behind the held request the drain does nothing,
+        # and cancel()'s queue.join() waits for a task_done() that never
+        # comes. Its finally blocks have still dropped the queue and client.
+        logger.debug("Execution stack of kernel %s reset (queue join timed out)",
+                     kernel_id)
     except Exception as error:  # noqa: BLE001 - best effort; logged
         logger.warning("Resetting the execution stack of kernel %s: %s",
                        kernel_id, error)

@@ -13,7 +13,7 @@ from typing import Optional, Any, Union, Literal, TYPE_CHECKING
 import asyncio
 from mcp.types import ImageContent
 from jupyter_mcp_server.jupyter_extension.backends.base import Backend
-from jupyter_mcp_server.utils import safe_extract_outputs
+from jupyter_mcp_server.utils import safe_extract_outputs, with_own_identity
 
 if TYPE_CHECKING:
     from jupyter_server.serverapp import ServerApp
@@ -385,7 +385,7 @@ class LocalBackend(Backend):
         
         # Get kernel client
         kernel = self.kernel_manager.get_kernel(kernel_id)
-        client = kernel.client()
+        client = with_own_identity(kernel.client())
         
         # Execute code
         msg_id = client.execute(source)

@@ -431,6 +431,11 @@ async def _drop_if_never_started(execution_stack, kernel_manager, kernel_id,
     registry().ready.discard(kernel_id)
     waited = time.time() - since
     held = _pending(execution_stack, kernel_id)
+    # Where the worker holds it, read before the cancel unwinds it: the cause
+    # is still unknown, and the server's log is only its terminal.
+    holder = worker_state(execution_stack, kernel_id)
+    logger.warning("Kernel %s: request(s) %s held %.0f s without reaching the "
+                   "kernel; %s", kernel_id, held, waited, holder)
     try:
         await _cancel(execution_stack, kernel_id, timeout)
     except asyncio.CancelledError:
@@ -442,7 +447,7 @@ async def _drop_if_never_started(execution_stack, kernel_manager, kernel_id,
         reason = (f"kernel {kernel_id} received nothing in the {waited:.0f} s "
                   f"after it was submitted, while idle and answering: the "
                   f"server's execution queue held it and never sent it. The "
-                  f"queue has been reset.")
+                  f"queue has been reset. (Server side: {holder}.)")
         _answer(execution_stack, kernel_id, held, NOT_STARTED, reason)
     else:
         reason = (f"the server's execution queue for kernel {kernel_id} held "
@@ -450,9 +455,45 @@ async def _drop_if_never_started(execution_stack, kernel_manager, kernel_id,
                   f"and was reset; the kernel became active just as it was, so "
                   f"the request may have reached it at the last moment and "
                   f"be running with nobody collecting its output. Check "
-                  f"kernel_status before running it again.")
+                  f"kernel_status before running it again. (Server side: "
+                  f"{holder}.)")
         _answer(execution_stack, kernel_id, held, DROPPED, reason)
     return reason
+
+
+def worker_state(execution_stack: Any, kernel_id: str) -> str:
+    """Where nbmodel's worker for ``kernel_id`` is, in one line.
+
+    A held request is either queued behind a worker suspended in some await
+    (the chain names it, down to the future it waits on), or queued for a
+    worker that has died -- ``put`` never replaces a finished one, so every
+    later request on the kernel waits forever.
+    """
+    workers = getattr(execution_stack, "_ExecutionStack__workers", None)
+    worker = workers.get(kernel_id) if isinstance(workers, dict) else None
+    if worker is None:
+        return "no worker"
+    if worker.done():
+        if worker.cancelled():
+            return "worker finished (cancelled)"
+        return f"worker finished, raising {worker.exception()!r}"
+    links, coro, uid = [], worker.get_coro(), None
+    while coro is not None and len(links) < 20:
+        frame = getattr(coro, "cr_frame", None) or getattr(coro, "gi_frame", None)
+        if frame is None:
+            links.append(type(coro).__name__)
+            break
+        if uid is None and "uid" in frame.f_locals:
+            uid = frame.f_locals["uid"]
+        links.append(f"{frame.f_code.co_name}:{frame.f_lineno}")
+        nxt = getattr(coro, "cr_await", None) or getattr(coro, "gi_yieldfrom", None)
+        if nxt is None:
+            break
+        if not hasattr(nxt, "cr_frame") and not hasattr(nxt, "gi_frame"):
+            links.append(repr(nxt)[:120])
+            break
+        coro = nxt
+    return f"worker on request {uid}, awaiting {' > '.join(links)}"
 
 
 def quiet_since(kernel_manager: Any, kernel_id: str, since: float) -> bool:
@@ -480,10 +521,11 @@ async def kernel_answers(kernel_manager: Any, kernel_id: str,
     """Whether the kernel answers ``kernel_info`` within ``timeout``, on a
     client of its own: alive, and reading what is sent to it."""
     from inspect import isawaitable
+    from jupyter_mcp_server.utils import with_own_identity
 
     timeout = PROBE_TIMEOUT_S if timeout is None else timeout
     try:
-        client = kernel_manager.get_kernel(kernel_id).client()
+        client = with_own_identity(kernel_manager.get_kernel(kernel_id).client())
     except Exception:  # noqa: BLE001 - no kernel, no answer
         return False
     try:

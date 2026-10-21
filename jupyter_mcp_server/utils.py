@@ -459,6 +459,28 @@ async def safe_notebook_operation(operation_func, max_retries=3):
 CLIENT_READY_TIMEOUT_S = 30
 
 
+def with_own_identity(client):
+    """``client``, connecting to its kernel under a routing identity of its own.
+
+    jupyter_client connects shell, stdin and control under the session id, and
+    every ``KernelManager.client()`` gets a clone of the manager's session --
+    the same id, so every such client of one kernel has the same identity.
+    ipykernel's ROUTERs hand an identity to whichever socket connected with it
+    last (``ROUTER_HANDOVER``): a second client silently takes the first one's
+    route, and what the first sends after that never reaches the kernel. Each
+    ``execute_code`` cut the stack's cached client off this way, so the next
+    cell "never reached the kernel" (2026-10-01 to 10-20: 13 of 15 [NOT
+    STARTED] cells came straight after an execute_code).
+
+    Called before a channel is first touched: a socket takes the identity
+    when it connects, and the channel properties connect on first access.
+    """
+    import uuid
+
+    client.session.session = str(uuid.uuid4())
+    return client
+
+
 async def ensure_stack_client_ready(execution_stack, kernel_id: str, logger) -> None:
     """Make the stack's client for ``kernel_id`` ready before it is first used.
 
@@ -488,6 +510,8 @@ async def ensure_stack_client_ready(execution_stack, kernel_id: str, logger) -> 
         return
     try:
         client = execution_stack._get_client(kernel_id)
+        if getattr(client, "_shell_channel", None) is None:
+            with_own_identity(client)
         started = client.start_channels()
         if isawaitable(started):
             await started
@@ -767,7 +791,7 @@ async def _execute_code_local(serverapp, code, kernel_id, timeout, logger):
         # Get the kernel using pinned_superclass pattern (like KernelUsageHandler)
         lkm = kernel_manager.pinned_superclass.get_kernel(kernel_manager, kernel_id)
         session = lkm.session
-        client = lkm.client()
+        client = with_own_identity(lkm.client())
         
         # Ensure channels are started (critical for receiving IOPub messages!)
         if not client.channels_running:

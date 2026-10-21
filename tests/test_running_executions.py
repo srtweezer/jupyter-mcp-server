@@ -21,6 +21,7 @@ import time
 from datetime import datetime, timezone
 
 import pytest
+from jupyter_client.session import Session
 
 from jupyter_mcp_server import running
 from jupyter_mcp_server.running import (
@@ -167,6 +168,8 @@ class ReadyingStack:
         stack = self
 
         class Client:
+            session = Session(session="the-kernel-managers")
+
             def start_channels(self):
                 stack.calls.append("start_channels")
 
@@ -197,10 +200,31 @@ async def test_the_client_is_ready_before_its_first_request_and_only_then(monkey
     await ensure_stack_client_ready(stack, "k", log)
     await ensure_stack_client_ready(stack, "k", log)
     assert stack.calls == ["start_channels", "wait_for_ready"], "once per kernel"
+    assert stack.client.session.session != "the-kernel-managers", \
+        "connected under an identity of its own"
 
     await running.reset_stack(stack, "k")           # a restart
     await ensure_stack_client_ready(stack, "k", log)
     assert stack.calls[-3:] == ["cancel", "start_channels", "wait_for_ready"]
+
+
+def test_two_clients_of_one_kernel_connect_as_two():
+    """Every ``KernelManager.client()`` clones the manager's session, id and
+    all, and the id is the routing identity its shell socket connects under.
+    ipykernel hands an identity to the socket that connected with it last, so
+    the second client took the first one's route: the stack's cached client
+    sent the next cell into nothing after every execute_code."""
+    from jupyter_client.manager import KernelManager
+    from jupyter_mcp_server.utils import with_own_identity
+
+    km = KernelManager()
+    assert km.client().session.bsession == km.client().session.bsession, \
+        "the hazard: clients share an identity unless given their own"
+
+    first, second = with_own_identity(km.client()), with_own_identity(km.client())
+    assert first.session.bsession != second.session.bsession
+    assert km.session.bsession not in (first.session.bsession, second.session.bsession)
+    assert first.session.key == km.session.key, "still signs what the kernel accepts"
 
 
 @pytest.mark.asyncio
@@ -309,6 +333,8 @@ class Kernels:
         kernels = self
 
         class Probe:
+            session = Session()
+
             def start_channels(self):
                 pass
 
@@ -389,6 +415,35 @@ async def test_a_request_the_kernel_never_received_says_so_in_seconds(quick_chec
     assert kernels.probes == 1, "one drop answers both"
     assert quick_check.running("k") == [], "nothing left to follow"
     assert "k" not in quick_check.ready, "the next request readies a new client"
+
+
+@pytest.mark.asyncio
+async def test_a_held_request_names_the_await_that_holds_it(quick_check):
+    """The cause is unknown and the server logs only to its terminal, so the
+    answer itself says where nbmodel's worker was."""
+    from jupyter_mcp_server.utils import execute_via_execution_stack
+
+    stack, kernels = stuck_stack(), Kernels(last=time.time() - 60)
+    answer = await execute_via_execution_stack(
+        serverapp_for(stack, kernels), "k", "load()", timeout=60, cell_index=2)
+
+    assert answer[0].startswith(NOT_STARTED_MARKER), answer
+    assert "Server side: worker on request" in answer[0], answer
+    assert ("kernel_worker:" in answer[0] and "_execute_snippet:" in answer[0]
+            and "execute_interactive:" in answer[0]), answer
+
+
+@pytest.mark.asyncio
+async def test_a_dead_worker_is_named_as_dead():
+    """``put`` never replaces a finished worker: every later request waits."""
+    stack = stuck_stack()
+    stack.put("k", "cell 2")
+    worker = stack._ExecutionStack__workers["k"]
+    worker.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await worker
+    assert running.worker_state(stack, "k") == "worker finished (cancelled)"
+    assert running.worker_state(stack, "other") == "no worker"
 
 
 @pytest.mark.asyncio
@@ -554,6 +609,22 @@ async def test_a_quick_first_cell_on_a_new_kernel_returns(lab_client):
         path = os.path.join("dev", "content", NOTEBOOK.replace(".ipynb", f"_{n}.ipynb"))
         if os.path.exists(path):
             os.remove(path)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(120)
+async def test_a_cell_after_execute_code_reaches_the_kernel(lab_client):
+    """execute_code's client connected under the stack client's identity and
+    took its route, so every cell run after an execute_code came back [NOT
+    STARTED] -- on 2026-10-20 deterministically, cell, code, cell."""
+    async with lab_client:
+        await lab_client.use_notebook("after_code", NOTEBOOK, mode="create")
+        for n in range(3):
+            await lab_client.insert_cell(n, "code", f"print('cell {n}')")
+        for n in range(3):
+            result = _text(await lab_client.execute_cell(n, timeout_seconds=20))
+            assert f"cell {n}" in result, f"cell {n}: {result}"
+            assert "2" in _text(await lab_client.execute_code("1 + 1", timeout=10))
 
 
 @pytest.mark.asyncio

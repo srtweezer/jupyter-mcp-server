@@ -424,6 +424,7 @@ async def interrupt_kernel(
 @with_hooks("unuse_notebook")
 async def unuse_notebook(
     notebook_name: Annotated[str, Field(description="Notebook identifier to disconnect")],
+    shutdown_kernel: Annotated[bool, Field(description="Also shut its kernel down and end its session. Default: the kernel keeps running.")] = False,
 ) -> Annotated[str, Field(description="Success message")]:
     """Unuse from a specific notebook and release its resources."""
     kid = notebook_manager.get_kernel_id(notebook_name) or "unknown"
@@ -432,6 +433,8 @@ async def unuse_notebook(
         notebook_name=notebook_name,
         notebook_manager=notebook_manager,
         kernel_manager=server_context.kernel_manager,
+        session_manager=server_context.session_manager,
+        shutdown_kernel=shutdown_kernel,
     )
     await HookRegistry.get_instance().fire(
         HookEvent.KERNEL_LIFECYCLE,
@@ -478,25 +481,14 @@ async def read_notebook(
 ###############################################################################
 # Cell Tools.
 
-from contextlib import contextmanager
-
-@contextmanager
 def _target_notebook(manager, name):
-    """Temporarily switch the active notebook if *name* is non-empty."""
-    if not name:
-        yield
-        return
-    if name not in manager:
-        raise ValueError(
-            f"Notebook '{name}' is not registered. "
-            f"Call use_notebook first to open it."
-        )
-    prev = manager.get_current_notebook()
-    manager._current_notebook = name
-    try:
-        yield
-    finally:
-        manager._current_notebook = prev
+    """Act on *name* for this request if it is non-empty.
+
+    ``NotebookManager.targeting``: per request. It used to switch the shared
+    active notebook for the length of the call, so a second agent's request
+    landing meanwhile acted on the first one's notebook.
+    """
+    return manager.targeting(name)
 
 @mcp.tool(
     annotations=ToolAnnotations(
@@ -766,8 +758,10 @@ async def move_cell(
 async def execute_code(
     code: Annotated[str, Field(description="Code to execute (supports magic commands with %, shell commands with !)")],
     timeout: Annotated[int, Field(description="Execution timeout in seconds",le=60)] = 30,
+    notebook_name: Annotated[str, Field(description="Run in this notebook's kernel. If omitted, the currently active notebook's.")] = "",
 ) -> Annotated[list[str | ImageContent], Field(description="List of outputs from the executed code")]:
-    """Execute code directly in the kernel (not saved to notebook) on the current activated notebook.
+    """Execute code directly in the kernel (not saved to notebook) on the current activated notebook,
+    or on ``notebook_name``'s when given.
 
     Recommended to use in following cases:
     1. Execute Jupyter magic commands(e.g., `%timeit`, `%pip install xxx`)
@@ -780,30 +774,31 @@ async def execute_code(
     1. Import new modules or perform variable assignments that affect subsequent Notebook execution
     2. Execute dangerous code that may harm the Jupyter server or the user's data without permission
     """
-    # Get kernel_id for JUPYTER_SERVER mode
-    # Let the tool handle getting kernel_id via get_current_notebook_context()
-    kernel_id = None
-    if server_context.mode == ServerMode.JUPYTER_SERVER:
-        current_notebook = notebook_manager.get_current_notebook() or "default"
-        kernel_id = notebook_manager.get_kernel_id(current_notebook)
-        # Note: kernel_id might be None here if notebook not in manager,
-        # but the tool will fall back to config values via get_current_notebook_context()
-    
-    return await safe_notebook_operation(
-        lambda: ExecuteCodeTool().execute(
-            mode=server_context.mode,
-            server_client=server_context.server_client,
-            kernel_manager=server_context.kernel_manager,
-            notebook_manager=notebook_manager,
-            code=code,
-            timeout=timeout,
-            kernel_id=kernel_id,
-            ensure_kernel_alive_fn=__ensure_kernel_alive,
-            wait_for_kernel_idle_fn=wait_for_kernel_idle,
-            safe_extract_outputs_fn=safe_extract_outputs,
-        ),
-        max_retries=1
-    )
+    with _target_notebook(notebook_manager, notebook_name):
+        # Get kernel_id for JUPYTER_SERVER mode
+        # Let the tool handle getting kernel_id via get_current_notebook_context()
+        kernel_id = None
+        if server_context.mode == ServerMode.JUPYTER_SERVER:
+            current_notebook = notebook_manager.get_current_notebook() or "default"
+            kernel_id = notebook_manager.get_kernel_id(current_notebook)
+            # Note: kernel_id might be None here if notebook not in manager,
+            # but the tool will fall back to config values via get_current_notebook_context()
+
+        return await safe_notebook_operation(
+            lambda: ExecuteCodeTool().execute(
+                mode=server_context.mode,
+                server_client=server_context.server_client,
+                kernel_manager=server_context.kernel_manager,
+                notebook_manager=notebook_manager,
+                code=code,
+                timeout=timeout,
+                kernel_id=kernel_id,
+                ensure_kernel_alive_fn=__ensure_kernel_alive,
+                wait_for_kernel_idle_fn=wait_for_kernel_idle,
+                safe_extract_outputs_fn=safe_extract_outputs,
+            ),
+            max_retries=1
+        )
 
 
 @mcp.tool(

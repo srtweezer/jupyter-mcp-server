@@ -9,7 +9,9 @@ This module provides centralized management for Jupyter notebooks and kernels,
 replacing the scattered global variable approach with a unified architecture.
 """
 
-from typing import Dict, Any, Optional, Callable, Union
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Dict, Any, Iterator, Optional, Callable, Union
 from types import TracebackType
 
 from jupyter_nbmodel_client import NbModelClient, get_notebook_websocket_url
@@ -60,6 +62,18 @@ class NotebookConnection:
         """Exit context, clean up connection."""
         if self._notebook:
             await self._notebook.__aexit__(exc_type, exc_val, exc_tb)
+
+
+#: The notebook one request names (``notebook_name``), for that request only.
+#:
+#: A request's task has its own copy of the context, so two requests in flight
+#: each see their own. Switching ``_current_notebook`` for the length of a call
+#: instead was a race between two agents: the tools await between reading the
+#: active notebook and acting on it, and a second agent's call could switch it
+#: in between -- its cell going into the other agent's notebook, or running in
+#: the other agent's kernel.
+_TARGETED: ContextVar[Optional[str]] = ContextVar("targeted_notebook",
+                                                  default=None)
 
 
 class NotebookManager:
@@ -302,10 +316,34 @@ class NotebookManager:
         """
         Get the name of the currently active notebook.
         
+        The notebook this request named (:meth:`targeting`) if it named one,
+        else the server's active notebook.
+
         Returns:
             Current notebook name or None if no active notebook
         """
+        targeted = _TARGETED.get()
+        if targeted is not None and targeted in self._notebooks:
+            return targeted
         return self._current_notebook
+
+    @contextmanager
+    def targeting(self, name: Optional[str]) -> Iterator[None]:
+        """Act on ``name`` for the rest of this request, leaving the server's
+        active notebook alone. No name: the active notebook, as before."""
+        if not name:
+            yield
+            return
+        if name not in self._notebooks:
+            raise ValueError(
+                f"Notebook '{name}' is not registered. "
+                f"Call use_notebook first to open it."
+            )
+        token = _TARGETED.set(name)
+        try:
+            yield
+        finally:
+            _TARGETED.reset(token)
     
     def get_current_connection(self) -> NotebookConnection:
         """
@@ -318,7 +356,7 @@ class NotebookManager:
         Raises:
             ValueError: If no notebooks exist and no default config is available
         """
-        current = self._current_notebook or self._default_notebook_name
+        current = self.get_current_notebook() or self._default_notebook_name
         
         # For backward compatibility: if the requested notebook doesn't exist but we're 
         # asking for default, create a connection using the default config
@@ -340,7 +378,7 @@ class NotebookManager:
         Returns:
             Notebook file path or None if no active notebook
         """
-        current = self._current_notebook or self._default_notebook_name
+        current = self.get_current_notebook() or self._default_notebook_name
         if current in self._notebooks:
             return self._notebooks[current]["notebook_info"].get("path")
         return None

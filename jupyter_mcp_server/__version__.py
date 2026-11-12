@@ -8,4 +8,4 @@
 # with every commit csgui pins: pip compares versions, not commits, so a pin
 # to a new commit under an unchanged version is resolved and then skipped as
 # "already installed".
-__version__ = "1.0.2.post3"
+__version__ = "1.0.2.post4"
